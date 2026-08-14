@@ -1,0 +1,29 @@
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    init: true
+    ipc: host
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    init: true
+    ipc: host
+    environment:
+      SPF_DATABASE_URL: sqlite:////tmp/sneakers-test.sqlite3

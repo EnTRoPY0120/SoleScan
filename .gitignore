@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+*.py[cod]
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+playwright/.auth/
+.env
+

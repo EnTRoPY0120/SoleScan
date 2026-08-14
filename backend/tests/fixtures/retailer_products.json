@@ -1,0 +1,8 @@
+{
+  "nike": "<script type=\"application/ld+json\">{\"@type\":\"Product\",\"name\":\"Nike Air Jordan 1 Low Black White\",\"brand\":{\"name\":\"Nike\"},\"model\":\"Air Jordan 1 Low\",\"color\":\"Black White\",\"sku\":\"553558-132\",\"image\":\"/shoe.jpg\",\"sizes\":[\"UK 8\",\"8.5\"],\"automaticDiscount\":500,\"conditionalOffers\":[{\"kind\":\"bank\",\"description\":\"10% with eligible card\"}],\"offers\":{\"price\":\"₹9,995\",\"priceCurrency\":\"INR\",\"availability\":\"https://schema.org/InStock\",\"url\":\"/air-jordan-1\",\"shippingDetails\":{\"shippingRate\":{\"value\":0}}}}</script>",
+  "adidas": "@nike", "puma": "@nike", "asics": "@nike", "new_balance": "@nike",
+  "converse": "@nike", "reebok": "@nike", "onitsuka_tiger": "@nike", "vegnonveg": "@nike",
+  "superkicks": "@nike", "limited_edt": "@nike", "foot_locker": "@nike", "myntra": "@nike",
+  "ajio": "@nike", "nykaa_fashion": "@nike"
+}
+
