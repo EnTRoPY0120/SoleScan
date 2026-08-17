@@ -6,7 +6,7 @@ from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
 
 from .base import AdapterError, PartialResultError, RetailerAdapter, RetailerBlockedError, RetailerDefinition, shared_client
-from ..normalization import effective_price, normalize_size, parse_inr_paise
+from ..normalization import canonical_query, classify_category, effective_price, extract_department, normalize_size, parse_inr_paise
 from ..schemas import Offer, SearchRequest
 
 
@@ -28,15 +28,18 @@ PUMA_SEMAPHORE = asyncio.Semaphore(2)
 class PumaAdapter(RetailerAdapter):
     definition = RetailerDefinition(
         "puma", "Puma India", "official", "https://in.puma.com/in/en/search?q={query}",
-        adapter_type="puma"
+        adapter_type="puma", footwear_only_scope=True
     )
 
     async def search(self, request: SearchRequest, *, bypass_cache: bool = False) -> list[Offer]:
-        search_url = self.definition.search_url.format(query=quote_plus(request.query))
+        search_url = self.definition.search_url.format(query=quote_plus(canonical_query(request, include_brand=False)))
         response = await shared_client.get(search_url)
         master_ids, client_version = self.parse_catalog(response.text)
-        master_ids = master_ids[:6]
-        if not master_ids:
+        catalog_ids = master_ids[:12]
+        # The catalog shell is inspected broadly, but detail/size calls stay
+        # bounded to eight exact candidates.
+        master_ids = catalog_ids[:8]
+        if not catalog_ids:
             return []
         auth = await self._guest_headers(client_version)
         
@@ -226,6 +229,8 @@ class PumaAdapter(RetailerAdapter):
                 brand=str(product.get("brand") or "Puma"),
                 model=str(product.get("name") or product.get("header") or ""),
                 colourway=variation.get("colorName"), image_url=image,
+                category="footwear" if not classify_category(title=variation.get("name") or product.get("name"), url=slug) == "non_footwear" else "non_footwear",
+                department=extract_department(gender=product.get("gender"), title=variation.get("name") or product.get("name"), url=slug),
                 style_code=str(variation.get("styleNumber") or variation_id or master_id),
                 requested_uk_size=requested, size_available=available,
                 stock_status=stock_status,

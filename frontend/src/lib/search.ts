@@ -75,6 +75,22 @@ export async function loadSearch(searchId: string): Promise<SearchResult> {
   return apiJson(response, 'Could not load search results.');
 }
 
+export async function startRetailerSession(retailerId: string, searchId: string): Promise<{ viewer_url: string }> {
+  const response = await fetch(`/api/retailers/${encodeURIComponent(retailerId)}/session/start`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ search_id: searchId })
+  });
+  return apiJson(response, 'Could not open the assisted retailer session.');
+}
+
+export async function completeRetailerSession(retailerId: string, searchId: string): Promise<{ id: string; cached: boolean }> {
+  const response = await fetch(`/api/retailers/${encodeURIComponent(retailerId)}/session/complete`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ search_id: searchId, challenge_cleared: true })
+  });
+  return apiJson(response, 'Could not complete the assisted retailer session.');
+}
+
 type EventSourceLike = {
   addEventListener(name: string, listener: (event: MessageEvent) => void): void;
   close(): void;

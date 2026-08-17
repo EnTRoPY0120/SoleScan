@@ -3,7 +3,7 @@ import re
 from datetime import datetime, timezone
 
 from .base import AdapterError, RetailerAdapter, RetailerDefinition, shared_client
-from ..normalization import effective_price, normalize_size, parse_inr_paise
+from ..normalization import canonical_query, classify_category, effective_price, extract_department, normalize_size, parse_inr_paise
 from ..schemas import Offer, SearchRequest
 
 
@@ -17,13 +17,13 @@ variants{attributes{code value_index} product{sku stock_status}}}}}}"""
 class ConverseAdapter(RetailerAdapter):
     definition = RetailerDefinition(
         "converse", "Converse India", "official",
-        "https://www.converse.in/search.html?query={query}",
+        "https://www.converse.in/search.html?query={query}", footwear_only_scope=True,
     )
 
     async def search(self, request: SearchRequest, *, bypass_cache: bool = False) -> list[Offer]:
         # The official catalog already scopes the brand; a stale optional brand
         # filter must not contaminate an otherwise precise Converse model query.
-        query = request.query
+        query = canonical_query(request, include_brand=False)
         response = await shared_client.post_json(
             "https://www.converse.in/graphql", {"query": QUERY, "variables": {"q": query}}
         )
@@ -71,6 +71,8 @@ class ConverseAdapter(RetailerAdapter):
                 retailer=self.definition.name, seller="Converse India",
                 product_name=str(product.get("name") or "Converse sneaker"), brand="Converse",
                 model=str(product.get("name") or ""), colourway=colourway,
+                category="footwear",
+                department=extract_department(title=product.get("name"), url=url_key),
                 image_url=(product.get("small_image") or {}).get("url"), style_code=sku,
                 requested_uk_size=requested, size_available=available,
                 stock_status=("in_stock" if available else "out_of_stock" if size_indexes else "unknown"),

@@ -13,6 +13,20 @@ class Department(str, Enum):
     kids = "kids"
 
 
+class ProductDepartment(str, Enum):
+    men = "men"
+    women = "women"
+    kids = "kids"
+    unisex = "unisex"
+    unknown = "unknown"
+
+
+class ProductCategory(str, Enum):
+    footwear = "footwear"
+    non_footwear = "non_footwear"
+    unknown = "unknown"
+
+
 class SearchRequest(BaseModel):
     query: str = Field(min_length=2, max_length=120)
     uk_size: str = Field(min_length=1, max_length=12)
@@ -26,6 +40,15 @@ class SearchRequest(BaseModel):
     def strip_text(cls, value: str | None) -> str | None:
         return value.strip() if isinstance(value, str) else value
 
+    @model_validator(mode="after")
+    def reject_brand_conflict(self) -> "SearchRequest":
+        # Import lazily to avoid a schemas -> normalization import cycle.
+        from .normalization import query_brand_conflict
+        conflict = query_brand_conflict(self)
+        if conflict:
+            raise ValueError(f"Query contains a conflicting brand: {conflict}")
+        return self
+
 
 class ConditionalOffer(BaseModel):
     kind: Literal["coupon", "bank", "membership", "other"] = "other"
@@ -36,11 +59,13 @@ class ConditionalOffer(BaseModel):
 class Offer(BaseModel):
     retailer: str
     seller: str | None = None
-    confidence: Literal["exact", "strong", "possible", "weak"] = "possible"
+    confidence: Literal["exact"] = "exact"
     product_name: str
     brand: str | None = None
     model: str | None = None
     colourway: str | None = None
+    category: ProductCategory = ProductCategory.unknown
+    department: ProductDepartment = ProductDepartment.unknown
     image_url: str | None = None
     style_code: str | None = None
     requested_uk_size: str
@@ -54,7 +79,17 @@ class Offer(BaseModel):
     product_url: str
     return_policy: str | None = None
     match_score: float = Field(ge=0, le=1)
+    # Internal ranking evidence; kept explicit so serialized cached offers are
+    # stable across pydantic versions.
+    colour_match: bool = True
     last_checked: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def legacy_confidence_is_exact_contract(cls, value: str | None) -> str:
+        # Older rows used strong/possible/weak confidence.  They remain
+        # readable, but the active API exposes only accepted exact offers.
+        return "exact"
 
     @model_validator(mode="after")
     def normalize_stock_status(self) -> "Offer":
@@ -68,8 +103,9 @@ class Offer(BaseModel):
 
 
 class RetailerStatus(BaseModel):
+    retailer_id: str | None = None
     retailer: str
-    state: Literal["pending", "running", "complete", "partial", "error", "blocked", "timeout", "cached", "manual"]
+    state: Literal["pending", "running", "complete", "partial", "error", "blocked", "timeout", "cached", "needs_session"]
     offer_count: int = 0
     error: str | None = None
     elapsed_ms: int | None = None
@@ -79,6 +115,8 @@ class RetailerStatus(BaseModel):
     circuit_state: Literal["closed", "open", "half_open"] = "closed"
     source: str | None = None
     retry_at: datetime | None = None
+    session_capable: bool = False
+    session_state: Literal["none", "starting", "active", "expired"] = "none"
 
 
 class SearchResult(BaseModel):
@@ -86,7 +124,6 @@ class SearchResult(BaseModel):
     request: SearchRequest
     state: Literal["running", "complete"]
     offers: list[Offer]
-    weak_matches: list[Offer] = Field(default_factory=list)
     retailers: list[RetailerStatus]
     created_at: datetime
     completed_at: datetime | None = None
@@ -98,9 +135,23 @@ class RetailerInfo(BaseModel):
     name: str
     kind: Literal["official", "boutique", "marketplace"]
     enabled: bool
-    collection_mode: Literal["automatic", "manual"]
+    collection_mode: Literal["automatic"]
     source: str
     health: Literal["healthy", "unavailable", "unknown"]
     last_error: str | None = None
     paused: bool = False
     retry_at: datetime | None = None
+    session_capable: bool = False
+    session_state: Literal["none", "starting", "active", "expired"] = "none"
+
+
+class RetailerSessionStart(BaseModel):
+    search_id: UUID
+
+
+class RetailerSessionComplete(BaseModel):
+    search_id: UUID
+    # The UI sets this only after the user has cleared a visible consent or
+    # verification screen.  Credentials and challenge answers are never sent
+    # to the API.
+    challenge_cleared: bool | None = None

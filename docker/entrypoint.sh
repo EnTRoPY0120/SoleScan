@@ -9,4 +9,4 @@ chmod -R g+rwX /app/data /app/logs
 
 cd /app/backend
 exec setpriv --reuid=pwuser --regid=pwuser --init-groups \
-  sh -c 'alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000'
+  sh -c 'if command -v Xvfb >/dev/null 2>&1; then Xvfb :99 -screen 0 1280x900x24 >/tmp/xvfb.log 2>&1 & export DISPLAY=:99; command -v x11vnc >/dev/null 2>&1 && x11vnc -display :99 -localhost -forever -rfbport 5900 >/tmp/x11vnc.log 2>&1 & command -v websockify >/dev/null 2>&1 && websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/websockify.log 2>&1 & fi; alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000'

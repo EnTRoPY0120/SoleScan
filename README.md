@@ -30,6 +30,9 @@ Runtime SQLite data and logs persist in the repository's `data/` and `logs/` dir
 - `POST /api/search/{id}/refresh` — repeat and bypass the ten-minute cache
 - `GET /api/retailers` — configured source health
 - `GET /api/health` — readiness
+- `POST /api/retailers/{retailer_id}/session/start` — open a localhost-only assisted browser for a verification screen
+- `POST /api/retailers/{retailer_id}/session/complete` — save the user-cleared browser state and rerun the search
+- `DELETE /api/retailers/{retailer_id}/session` — remove the saved retailer browser state
 
 Prices are integer paise internally. Ranking uses list price minus automatic discount plus known shipping. Conditional promotions are disclosed but excluded. Unknown-shipping offers rank behind comparable known delivered totals.
 
@@ -37,6 +40,6 @@ Prices are integer paise internally. Ranking uses list price minus automatic dis
 
 New Balance uses the searchable Indian catalog operated by its authorized Indian retailer, Brandman Retail, and is identified as **New Balance · Brandman** in source status. Brandman remains a separate retailer with links to its own product pages; it is not represented as a New Balance-owned website. Converse uses its storefront GraphQL catalog. Reebok, Foot Locker, AJIO, Myntra, and Nykaa Fashion use isolated browser contexts inside one shared Chromium process; the remaining stores use ordinary pages and embedded structured data.
 
-Collectors distinguish valid zero-result pages from timeouts, missing pages, and verification challenges. They do not bypass authentication, CAPTCHAs, access controls, or anti-bot restrictions, so genuine transient blocking appears as a concise per-retailer error.
+All configured sources are attempted automatically. Collectors distinguish valid zero-result pages from timeouts, missing pages, and verification challenges. They do not bypass authentication, CAPTCHAs, access controls, or anti-bot restrictions, so genuine transient blocking appears as a concise per-retailer error. When a browser-backed retailer presents a challenge, the UI can open one isolated headful session through the localhost VNC viewer; users should clear only the visible consent/verification screen and never enter retailer credentials. Saved browser state is stored under `data/browser-sessions` with restrictive permissions.
 
 Runtime databases, logs, caches, browser state, build output, and dependencies are ignored by Git. Logs record retailer IDs and error classes, never cookies or credentials.

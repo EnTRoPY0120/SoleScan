@@ -12,6 +12,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from ..config import settings
+from ..normalization import canonical_query
 from ..schemas import Offer, SearchRequest
 
 
@@ -73,6 +74,11 @@ class RetailerDefinition:
     uses_browser: bool = False
     adapter_type: str | None = None  # "shopify", "browser", "structured", "puma", "converse", "brandman", "vegnonveg"
     collection_mode: str = "automatic"
+    # An unknown product category may only pass the domain filter when the
+    # collector's contract is explicitly footwear-only.  Multi-category
+    # storefronts must provide category evidence in each offer instead.
+    footwear_only_scope: bool = False
+    session_capable: bool = False
 
 
 class RetailerAdapter(ABC):
@@ -312,7 +318,8 @@ class RateLimitedClient:
 shared_client = RateLimitedClient()
 
 
-def build_search_url(template: str, request: SearchRequest) -> str:
-    # Brand and colour remain downstream match filters. Store search engines get
-    # the model exactly once, which avoids broad OR matching and duplicate tokens.
-    return template.format(query=quote_plus(request.query))
+def build_search_url(template: str, request: SearchRequest, *, include_brand: bool = False) -> str:
+    # Use one canonical query token stream. Official single-brand stores can
+    # omit the brand; marketplaces and boutiques pass include_brand=True.
+    query = canonical_query(request, include_brand=include_brand)
+    return template.format(query=quote_plus(query))

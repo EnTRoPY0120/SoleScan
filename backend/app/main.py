@@ -9,10 +9,11 @@ from sqlalchemy.exc import OperationalError
 import structlog
 
 from .adapters import DEFINITIONS
-from .adapters.browser import browser_pool
+from .adapters.base import build_search_url
+from .adapters.browser import ChallengeNotClearedError, SessionBusyError, assisted_sessions, browser_pool
 from .config import settings
 from .db import init_db
-from .schemas import RetailerInfo, SearchRequest, SearchResult
+from .schemas import RetailerInfo, RetailerSessionComplete, RetailerSessionStart, SearchRequest, SearchResult
 from .search import SearchNotFound, manager
 
 
@@ -65,10 +66,12 @@ async def retailers() -> list[RetailerInfo]:
             retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=cooldown_remaining)
         result.append(RetailerInfo(
             id=item.id, name=item.name, kind=item.kind, enabled=item.enabled,
-            collection_mode=item.collection_mode,
+            collection_mode="automatic",
             source=item.search_url.replace("{query}", ""),
             health=manager.health[item.id][0], last_error=manager.health[item.id][1],
             paused=paused, retry_at=retry_at,
+            session_capable=item.session_capable,
+            session_state=assisted_sessions.state_for(item.id),
         ))
     return result
 
@@ -98,6 +101,66 @@ async def refresh_search(search_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Search not found") from exc
     result = await manager.create(previous.request.model_copy(deep=True), bypass_cache=True)
     return {"id": str(result.id), "cached": False}
+
+
+def _definition(retailer_id: str):
+    return next((item for item in DEFINITIONS if item.id == retailer_id), None)
+
+
+@app.post("/api/retailers/{retailer_id}/session/start")
+async def start_retailer_session(retailer_id: str, body: RetailerSessionStart) -> dict:
+    definition = _definition(retailer_id)
+    if not definition:
+        raise HTTPException(status_code=404, detail="Retailer not found")
+    if not definition.session_capable:
+        raise HTTPException(status_code=409, detail="This retailer does not support assisted sessions")
+    try:
+        result = manager.get(str(body.search_id))
+    except SearchNotFound as exc:
+        raise HTTPException(status_code=404, detail="Search not found") from exc
+    try:
+        session = await assisted_sessions.start(
+            retailer_id, str(body.search_id), build_search_url(
+                definition.search_url,
+                result.request,
+                include_brand=definition.kind in {"boutique", "marketplace"},
+            )
+        )
+    except SessionBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Assisted browser is unavailable") from exc
+    return session
+
+
+@app.post("/api/retailers/{retailer_id}/session/complete", status_code=status.HTTP_202_ACCEPTED)
+async def complete_retailer_session(retailer_id: str, body: RetailerSessionComplete) -> dict:
+    definition = _definition(retailer_id)
+    if not definition:
+        raise HTTPException(status_code=404, detail="Retailer not found")
+    try:
+        previous = manager.get(str(body.search_id))
+    except SearchNotFound as exc:
+        raise HTTPException(status_code=404, detail="Search not found") from exc
+    try:
+        await assisted_sessions.complete(retailer_id, str(body.search_id), challenge_cleared=body.challenge_cleared)
+    except ChallengeNotClearedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
+        refreshed = await manager.create(previous.request.model_copy(deep=True), bypass_cache=True)
+    except SearchNotFound as exc:
+        raise HTTPException(status_code=404, detail="Search not found") from exc
+    return {"id": str(refreshed.id), "cached": False}
+
+
+@app.delete("/api/retailers/{retailer_id}/session")
+async def clear_retailer_session(retailer_id: str) -> dict:
+    if not _definition(retailer_id):
+        raise HTTPException(status_code=404, detail="Retailer not found")
+    await assisted_sessions.reset(retailer_id)
+    return {"retailer_id": retailer_id, "session_state": "none"}
 
 
 @app.get("/api/search/{search_id}/events")

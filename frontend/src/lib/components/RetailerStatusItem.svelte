@@ -1,7 +1,10 @@
 <script lang="ts">
   import type { RetailerStatus } from '$lib/types';
   export let retailer: RetailerStatus;
-  const icons: Record<RetailerStatus['state'], string> = { pending: '·', running: '◌', complete: '✓', partial: '◐', cached: '✓', blocked: '⊘', error: '!', timeout: '!', manual: '↗' };
+  export let searchId = '';
+  export let connect: (retailerId: string) => void = () => undefined;
+  export let complete: (retailerId: string) => void = () => undefined;
+  const icons: Record<RetailerStatus['state'], string> = { pending: '·', running: '◌', complete: '✓', partial: '◐', cached: '✓', blocked: '⊘', error: '!', timeout: '!', needs_session: '◉' };
   const baseDetail: Partial<Record<RetailerStatus['state'], string>> = { pending: 'Waiting…', running: 'Checking now…' };
   
   $: statusDetail = (() => {
@@ -9,8 +12,7 @@
     const reasonCode = retailer.reason_code;
     const offerCount = retailer.offer_count;
 
-    if (state === 'manual') return 'Available for manual check';
-    
+    if (state === 'needs_session') return 'Verification needed — connect retailer';
     // Partial state
     if (state === 'partial') {
       return 'Partial results (some products unavailable)';
@@ -55,7 +57,7 @@
     return retailer.error || baseDetail[state] || `${offerCount} found`;
   })();
 </script>
-<div class:error-state={retailer.state === 'error' || retailer.state === 'timeout'} class:blocked={retailer.state === 'blocked'} class:partial={retailer.state === 'partial'} class:manual={retailer.state === 'manual'} class:done={retailer.state === 'complete' || retailer.state === 'cached'}>
-  <span>{icons[retailer.state]}</span><span>{retailer.retailer}<small>{statusDetail}</small>{#if retailer.state === 'manual' && retailer.source}<a href={retailer.source} target="_blank" rel="noopener noreferrer">Open retailer</a>{/if}</span>
+<div class:error-state={retailer.state === 'error' || retailer.state === 'timeout'} class:blocked={retailer.state === 'blocked' || retailer.state === 'needs_session'} class:partial={retailer.state === 'partial'} class:done={retailer.state === 'complete' || retailer.state === 'cached'}>
+  <span>{icons[retailer.state]}</span><span>{retailer.retailer}<small>{statusDetail}</small>{#if retailer.state === 'needs_session' && retailer.session_capable}<button disabled={!searchId} on:click={() => connect(retailer.retailer_id || retailer.retailer)}>Connect retailer</button><button disabled={!searchId} on:click={() => complete(retailer.retailer_id || retailer.retailer)}>Done — refresh</button>{/if}</span>
 </div>
-<style>div{min-width:0;background:#e8e7e1;padding:12px 13px;display:flex;gap:10px;font-size:13px;border-radius:2px}span:first-child{font-weight:900}small{display:block;color:#68736d;margin-top:4px;font-size:12px;line-height:1.35;overflow-wrap:anywhere}a{display:inline-block;margin-top:7px;color:#174b36;font-size:12px;font-weight:800}.done{background:#e3f2d4}.manual{background:#e6edf2}.partial{background:#fff3cd;color:#856404;border:1px solid #ffc107}.error-state{background:#f7ddd7;color:#8c291b}.blocked{background:#f3e5bd;color:#694d00;border:1px dashed #b08c2f}</style>
+<style>div{min-width:0;background:#e8e7e1;padding:12px 13px;display:flex;gap:10px;font-size:13px;border-radius:2px}span:first-child{font-weight:900}small{display:block;color:#68736d;margin-top:4px;font-size:12px;line-height:1.35;overflow-wrap:anywhere}button{display:inline-block;margin-top:7px;color:#174b36;background:transparent;border:0;padding:0;font-size:12px;font-weight:800;cursor:pointer}.done{background:#e3f2d4}.partial{background:#fff3cd;color:#856404;border:1px solid #ffc107}.error-state{background:#f7ddd7;color:#8c291b}.blocked{background:#f3e5bd;color:#694d00;border:1px dashed #b08c2f}</style>

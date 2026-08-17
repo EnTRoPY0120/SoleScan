@@ -14,13 +14,12 @@ from .adapters import ADAPTERS, DEFINITIONS
 from .adapters.base import AdapterError, PartialResultError, RetailerAdapter, RetailerBlockedError, build_search_url
 from .config import settings
 from .db import AdapterRunRow, OfferRow, SearchRow, SessionLocal, utcnow
-from .normalization import confidence_for, deduplicate_offers, match_score, normalize_size, normalize_text, rank_offers
-from .schemas import Offer, RetailerStatus, SearchRequest, SearchResult
+from .normalization import accept_offer, classify_category, colour_matches, deduplicate_offers, extract_department, normalize_size, normalize_text, rank_offers
+from .schemas import Offer, ProductCategory, ProductDepartment, RetailerStatus, SearchRequest, SearchResult
 
 
 log = structlog.get_logger()
-MATCH_THRESHOLD = 0.55
-CACHE_VERSION = 5  # Collection modes and stock semantics changed; do not replay v4 jobs.
+CACHE_VERSION = 6  # Exact model/category/department contract; do not replay v5 jobs.
 
 
 class SearchNotFound(KeyError):
@@ -29,10 +28,7 @@ class SearchNotFound(KeyError):
 
 class SearchManager:
     def __init__(self, adapters: list[RetailerAdapter] | None = None) -> None:
-        self.adapters = list(
-            [adapter for adapter in ADAPTERS if adapter.definition.collection_mode == "automatic"]
-            if adapters is None else adapters
-        )
+        self.adapters = list(ADAPTERS if adapters is None else adapters)
         self.definitions = list(DEFINITIONS if adapters is None else [adapter.definition for adapter in self.adapters])
         self._results: dict[str, SearchResult] = {}
         self._events: dict[str, list[dict]] = defaultdict(list)
@@ -41,6 +37,13 @@ class SearchManager:
         self.health: dict[str, tuple[str, str | None]] = {
             definition.id: ("unknown", None) for definition in DEFINITIONS
         }
+
+    @staticmethod
+    def _source_url(definition, request: SearchRequest) -> str:
+        return build_search_url(
+            definition.search_url, request,
+            include_brand=definition.kind in {"boutique", "marketplace"},
+        )
 
     @staticmethod
     def cache_key(request: SearchRequest) -> str:
@@ -63,9 +66,12 @@ class SearchManager:
         now = utcnow()
         statuses = [
             RetailerStatus(
+                retailer_id=definition.id,
                 retailer=definition.name,
-                state="manual" if definition.collection_mode == "manual" else "pending",
-                source=build_search_url(definition.search_url, request),
+                state="pending",
+                source=self._source_url(definition, request),
+                session_capable=definition.session_capable,
+                session_state=self._session_state(definition.id),
             )
             for definition in self.definitions
         ]
@@ -79,18 +85,19 @@ class SearchManager:
                 id=search_id, cache_key=self.cache_key(request),
                 request_json=request.model_dump_json(), state="running", cached=False, created_at=now,
             ))
-            for definition in self.definitions:
-                if definition.collection_mode == "manual":
-                    db.add(AdapterRunRow(
-                        search_id=search_id, retailer_id=definition.id, state="manual",
-                        offer_count=0, source_url=build_search_url(definition.search_url, request),
-                        created_at=now,
-                    ))
         await self._emit(search_id, "search_started", {"search_id": search_id})
         task = asyncio.create_task(self._run(search_id, bypass_cache=bypass_cache))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return result
+
+    @staticmethod
+    def _session_state(retailer_id: str) -> str:
+        try:
+            from .adapters.browser import assisted_sessions
+            return assisted_sessions.state_for(retailer_id)
+        except Exception:
+            return "none"
 
     def _find_cached(self, request: SearchRequest) -> SearchRow | None:
         cutoff = utcnow() - timedelta(seconds=settings.cache_ttl_seconds)
@@ -109,11 +116,10 @@ class SearchManager:
             offers = db.scalars(select(OfferRow).where(OfferRow.search_id == source.id)).all()
             runs = db.scalars(select(AdapterRunRow).where(AdapterRunRow.search_id == source.id)).all()
         strong = [Offer.model_validate_json(row.offer_json) for row in offers if not row.weak]
-        weak = [Offer.model_validate_json(row.offer_json) for row in offers if row.weak]
         statuses = [self._status_from_run(row, cached=True) for row in runs]
         result = SearchResult(
             id=UUID(new_id), request=request, state="complete", offers=rank_offers(strong),
-            weak_matches=rank_offers(weak), retailers=statuses, created_at=now,
+            retailers=statuses, created_at=now,
             completed_at=now, cached=True,
         )
         self._results[new_id] = result
@@ -140,7 +146,7 @@ class SearchManager:
     async def _run(self, search_id: str, *, bypass_cache: bool) -> None:
         tasks = [
             asyncio.create_task(self._run_adapter(search_id, adapter, bypass_cache))
-            for adapter in self.adapters if adapter.definition.collection_mode == "automatic"
+            for adapter in self.adapters
         ]
         try:
             async with asyncio.timeout(settings.overall_timeout_seconds):
@@ -173,7 +179,6 @@ class SearchManager:
                                 ))
         result = self._results[search_id]
         result.offers = rank_offers(deduplicate_offers(result.offers))
-        result.weak_matches = rank_offers(deduplicate_offers(result.weak_matches))
         result.state = "complete"
         result.completed_at = utcnow()
         with SessionLocal.begin() as db:
@@ -192,29 +197,31 @@ class SearchManager:
         state = "complete"
         error = None
         accepted: list[Offer] = []
-        weak: list[Offer] = []
+        definition = adapter.definition
         try:
             async with asyncio.timeout(settings.retailer_timeout_seconds):
                 offers = await adapter.search(result.request, bypass_cache=bypass_cache)
-            for offer in offers:
-                score = match_score(result.request, offer)
-                offer.match_score = score
-                offer.confidence = confidence_for(score)
-                (accepted if score >= MATCH_THRESHOLD else weak).append(offer)
-            result.offers.extend(accepted)
-            result.weak_matches.extend(weak)
-            status.state = "complete"
-            status.offer_count = len(accepted)
-            self.health[adapter.definition.id] = ("healthy", None)
+                for offer in offers:
+                    self._prepare_offer(offer)
+                    offer.colour_match = colour_matches(result.request, offer)
+                    if accept_offer(result.request, offer, footwear_scope_verified=definition.footwear_only_scope):
+                        offer.match_score = 1
+                        offer.confidence = "exact"
+                        accepted.append(offer)
+                result.offers.extend(accepted)
+                status.state = "complete"
+                status.offer_count = len(accepted)
+                self.health[adapter.definition.id] = ("healthy", None)
         except PartialResultError as exc:
             # Some products succeeded - use partial offers
             for offer in exc.offers:
-                score = match_score(result.request, offer)
-                offer.match_score = score
-                offer.confidence = confidence_for(score)
-                (accepted if score >= MATCH_THRESHOLD else weak).append(offer)
+                self._prepare_offer(offer)
+                offer.colour_match = colour_matches(result.request, offer)
+                if accept_offer(result.request, offer, footwear_scope_verified=definition.footwear_only_scope):
+                    offer.match_score = 1
+                    offer.confidence = "exact"
+                    accepted.append(offer)
             result.offers.extend(accepted)
-            result.weak_matches.extend(weak)
             state = status.state = "partial"
             status.offer_count = len(accepted)
             status.error = str(exc)[:300]
@@ -227,7 +234,9 @@ class SearchManager:
             status.reason_code = "retailer_timeout"
             self.health[adapter.definition.id] = ("unavailable", error)
         except RetailerBlockedError as exc:
-            state = status.state = "blocked"
+            state = status.state = "needs_session" if (
+                definition.session_capable and exc.reason_code == "verification_challenge"
+            ) else "blocked"
             error = status.error = str(exc)[:300] or "Retailer was not checked"
             self._apply_diagnostics(status, exc)
             self.health[adapter.definition.id] = ("unavailable", error)
@@ -237,7 +246,7 @@ class SearchManager:
                 retry_count=exc.retry_count, circuit_state=exc.circuit_state,
             )
         except AdapterError as exc:
-            state = status.state = "error"
+            state = status.state = "timeout" if exc.reason_code == "retailer_timeout" else "error"
             error = status.error = str(exc)[:300] or "Retailer was unavailable"
             self._apply_diagnostics(status, exc)
             self.health[adapter.definition.id] = ("unavailable", error)
@@ -262,13 +271,19 @@ class SearchManager:
             ))
             for offer in accepted:
                 db.add(OfferRow(search_id=search_id, retailer_id=adapter.definition.id, offer_json=offer.model_dump_json(), weak=False, checked_at=utcnow()))
-            for offer in weak:
-                db.add(OfferRow(search_id=search_id, retailer_id=adapter.definition.id, offer_json=offer.model_dump_json(), weak=True, checked_at=utcnow()))
         event = "retailer_complete" if state in {"complete", "partial"} else "retailer_error"
         await self._emit(search_id, event, {
             **status.model_dump(mode="json"),
             "offers": [offer.model_dump(mode="json") for offer in accepted],
         })
+
+    @staticmethod
+    def _prepare_offer(offer: Offer) -> None:
+        """Fill evidence fields when an adapter omitted them."""
+        if getattr(offer, "category", None) in (None, "unknown"):
+            offer.category = ProductCategory(classify_category(title=offer.product_name, url=offer.product_url))
+        if getattr(offer, "department", None) in (None, "unknown"):
+            offer.department = ProductDepartment(extract_department(title=offer.product_name, url=offer.product_url))
 
     @staticmethod
     def _apply_diagnostics(status: RetailerStatus, exc: AdapterError) -> None:
@@ -302,10 +317,21 @@ class SearchManager:
                 raise SearchNotFound(search_id)
             offers = db.scalars(select(OfferRow).where(OfferRow.search_id == search_id)).all()
             runs = db.scalars(select(AdapterRunRow).where(AdapterRunRow.search_id == search_id)).all()
+        valid_offers: list[Offer] = []
+        for row in offers:
+            if row.weak:
+                continue
+            offer = Offer.model_validate_json(row.offer_json)
+            definition = next((item for item in DEFINITIONS if item.id == row.retailer_id), None)
+            self._prepare_offer(offer)
+            if definition is not None and accept_offer(
+                SearchRequest.model_validate_json(search.request_json), offer,
+                footwear_scope_verified=definition.footwear_only_scope,
+            ):
+                valid_offers.append(offer)
         result = SearchResult(
             id=UUID(search.id), request=SearchRequest.model_validate_json(search.request_json), state=search.state,
-            offers=rank_offers([Offer.model_validate_json(x.offer_json) for x in offers if not x.weak]),
-            weak_matches=rank_offers([Offer.model_validate_json(x.offer_json) for x in offers if x.weak]),
+            offers=rank_offers(valid_offers),
             retailers=[self._status_from_run(run) for run in runs],
             created_at=search.created_at, completed_at=search.completed_at, cached=search.cached,
         )
@@ -314,8 +340,9 @@ class SearchManager:
 
     @staticmethod
     def _status_from_run(run: AdapterRunRow, *, cached: bool = False) -> RetailerStatus:
-        state = "cached" if cached and run.state == "complete" else run.state
+        state = "cached" if cached and run.state == "complete" else ("needs_session" if run.state == "manual" else run.state)
         status = RetailerStatus(
+            retailer_id=run.retailer_id,
             retailer=next((d.name for d in DEFINITIONS if d.id == run.retailer_id), run.retailer_id),
             state=state,
             offer_count=run.offer_count,
@@ -326,6 +353,8 @@ class SearchManager:
             retry_count=run.retry_count,
             circuit_state=run.circuit_state,
             source=run.source_url,
+            session_capable=next((d.session_capable for d in DEFINITIONS if d.id == run.retailer_id), False),
+            session_state=SearchManager._session_state(run.retailer_id),
         )
         SearchManager._apply_retry_at(status)
         return status

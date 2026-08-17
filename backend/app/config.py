@@ -16,7 +16,8 @@ class Settings:
     overall_timeout_seconds: float = float(os.getenv("SPF_OVERALL_TIMEOUT", "45"))
     user_agent: str = "SneakerPriceFinder/0.1 (local personal price comparison)"
     frontend_build: Path = ROOT / "frontend" / "build"
+    browser_sessions_dir: Path = Path(os.getenv("SPF_BROWSER_SESSIONS_DIR") or str(ROOT / "data" / "browser-sessions"))
+    vnc_url: str = os.getenv("SPF_VNC_URL") or "http://127.0.0.1:6080/vnc.html"
 
 
 settings = Settings()
-

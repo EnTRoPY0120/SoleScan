@@ -6,19 +6,19 @@ from urllib.parse import quote_plus, urljoin, urlsplit
 from bs4 import BeautifulSoup
 
 from .base import AdapterError, RetailerAdapter, RetailerDefinition, shared_client
-from ..normalization import effective_price, normalize_size, parse_inr_paise
+from ..normalization import canonical_query, classify_category, effective_price, extract_department, normalize_size, parse_inr_paise
 from ..schemas import Offer, SearchRequest
 
 
 class VegNonVegAdapter(RetailerAdapter):
     definition = RetailerDefinition(
         "vegnonveg", "VegNonVeg", "boutique", "https://www.vegnonveg.com/search?q={query}",
-        adapter_type="vegnonveg"
+        adapter_type="vegnonveg", footwear_only_scope=True
     )
 
     async def search(self, request: SearchRequest, *, bypass_cache: bool = False) -> list[Offer]:
         response = await shared_client.get(
-            self.definition.search_url.format(query=quote_plus(request.query))
+            self.definition.search_url.format(query=quote_plus(canonical_query(request, include_brand=True)))
         )
         links = self.parse_search_links(response.text, str(response.url))
         semaphore = asyncio.Semaphore(2)
@@ -28,7 +28,7 @@ class VegNonVegAdapter(RetailerAdapter):
                 product = await shared_client.get(link)
             return self.parse(product.text, request, link)
 
-        batches = await asyncio.gather(*(collect(link) for link in links[:6]), return_exceptions=True)
+        batches = await asyncio.gather(*(collect(link) for link in links[:8]), return_exceptions=True)
         offers = [offer for batch in batches if isinstance(batch, list) for offer in batch]
         failures = sum(isinstance(item, Exception) for item in batches)
         if failures and offers:
@@ -100,6 +100,8 @@ class VegNonVegAdapter(RetailerAdapter):
         return [Offer(
             retailer=self.definition.name, seller="VegNonVeg", product_name=name,
             brand=brand, model=name, colourway=colour,
+            category="footwear",
+            department=extract_department(title=name, url=source_url),
             image_url=str(image.get("content")) if image and image.get("content") else None,
             style_code=article.get_text(" ", strip=True) or None,
             requested_uk_size=requested, size_available=available,

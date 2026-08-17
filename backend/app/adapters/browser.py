@@ -1,13 +1,17 @@
 import asyncio
+import json
+import os
 import re
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import quote_plus, urljoin
 
 from bs4 import BeautifulSoup
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
-from .base import AdapterError, RetailerAdapter, RetailerBlockedError, RetailerDefinition, detect_challenge
-from ..normalization import effective_price, normalize_size, parse_inr_paise
+from .base import AdapterError, PartialResultError, RetailerAdapter, RetailerBlockedError, RetailerDefinition, detect_challenge
+from ..normalization import canonical_query, classify_category, effective_price, extract_department, normalize_size, parse_inr_paise, recognized_brands
 from ..schemas import ConditionalOffer, Offer, SearchRequest
 
 
@@ -26,6 +30,8 @@ class BrowserPool:
     def __init__(self, max_contexts: int = 3) -> None:
         self._playwright = None
         self._browser = None
+        self._assisted_playwright = None
+        self._assisted_browser = None
         self._lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(max_contexts)
 
@@ -41,14 +47,15 @@ class BrowserPool:
                 self._playwright = None
                 raise
 
-    async def context(self):
+    async def context(self, storage_state: str | None = None):
         await self.start()
         await self._semaphore.acquire()
         try:
-            return await self._browser.new_context(
-                locale="en-IN", timezone_id="Asia/Kolkata",
-                viewport={"width": 1280, "height": 900},
-            )
+            kwargs = {"locale": "en-IN", "timezone_id": "Asia/Kolkata",
+                      "viewport": {"width": 1280, "height": 900}}
+            if storage_state and os.path.exists(storage_state):
+                kwargs["storage_state"] = storage_state
+            return await self._browser.new_context(**kwargs)
         except Exception:
             self._semaphore.release()
             raise
@@ -61,14 +68,168 @@ class BrowserPool:
 
     async def stop(self) -> None:
         async with self._lock:
-            if self._browser:
-                await self._browser.close()
-            if self._playwright:
-                await self._playwright.stop()
-            self._browser = self._playwright = None
+            try:
+                if self._browser:
+                    await self._browser.close()
+            finally:
+                try:
+                    if self._playwright:
+                        await self._playwright.stop()
+                finally:
+                    try:
+                        if self._assisted_browser:
+                            await self._assisted_browser.close()
+                    finally:
+                        if self._assisted_playwright:
+                            await self._assisted_playwright.stop()
+                        self._browser = self._playwright = self._assisted_browser = self._assisted_playwright = None
+
+    async def assisted_context(self, storage_state: str | None = None):
+        """Open an isolated headful context for a user-cleared challenge.
+
+        The runtime compose file provides Xvfb/x11vnc/websockify on localhost;
+        keeping this separate from normal headless collection prevents a
+        challenge session from changing ordinary search behaviour.
+        """
+        async with self._lock:
+            connected = bool(
+                self._assisted_browser
+                and getattr(self._assisted_browser, "is_connected", lambda: True)()
+            )
+            if not self._assisted_playwright or not connected:
+                self._assisted_playwright = await async_playwright().start()
+                try:
+                    self._assisted_browser = await self._assisted_playwright.chromium.launch(headless=False)
+                except Exception:
+                    await self._assisted_playwright.stop()
+                    self._assisted_playwright = self._assisted_browser = None
+                    raise
+        await self._semaphore.acquire()
+        try:
+            kwargs = {"locale": "en-IN", "timezone_id": "Asia/Kolkata",
+                      "viewport": {"width": 1280, "height": 900}}
+            if storage_state and os.path.exists(storage_state):
+                kwargs["storage_state"] = storage_state
+            return await self._assisted_browser.new_context(**kwargs)
+        except Exception:
+            self._semaphore.release()
+            raise
 
 
 browser_pool = BrowserPool()
+
+
+class SessionBusyError(RuntimeError):
+    pass
+
+
+class ChallengeNotClearedError(RuntimeError):
+    pass
+
+
+class AssistedBrowserSessions:
+    """Single-user, single-retailer assisted browser session coordinator."""
+
+    def __init__(self, pool: BrowserPool | None = None, directory=None) -> None:
+        from ..config import settings
+        self.pool = pool or browser_pool
+        self.directory = Path(directory or settings.browser_sessions_dir)
+        self._lock = asyncio.Lock()
+        self._active: dict | None = None
+
+    def state_for(self, retailer_id: str) -> str:
+        path = self.directory / f"{retailer_id}.json"
+        if not path.exists():
+            return "none"
+        try:
+            payload = json.loads(path.read_text())
+            if not isinstance(payload, dict):
+                return "expired"
+            cookies = payload.get("cookies", [])
+            if not isinstance(cookies, list):
+                return "expired"
+            if any(not isinstance(cookie, dict) for cookie in cookies):
+                return "expired"
+            finite = [float(cookie.get("expires", -1)) for cookie in cookies if float(cookie.get("expires", -1)) > 0]
+            if finite and max(finite) <= time.time():
+                return "expired"
+        except (OSError, ValueError, TypeError):
+            return "expired"
+        return "active"
+
+    async def start(self, retailer_id: str, search_id: str, url: str) -> dict:
+        async with self._lock:
+            if self._active is not None:
+                raise SessionBusyError("Another retailer session is already active")
+            self.directory.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(self.directory, 0o700)
+            except OSError:
+                pass
+            path = self.directory / f"{retailer_id}.json"
+            usable_state = path.exists() and self.state_for(retailer_id) == "active"
+            try:
+                context = await self.pool.assisted_context(str(path) if usable_state else None)
+            except TypeError:
+                # Keep small test/dry-run pools compatible with the original
+                # no-argument context hook; production BrowserPool supports
+                # storage state explicitly.
+                context = await self.pool.assisted_context()
+            try:
+                page = await context.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+            except Exception:
+                # Navigation failures must not consume the single assisted
+                # session slot or leave a browser context holding a semaphore
+                # permit indefinitely.
+                await self.pool.release(context)
+                raise
+            self._active = {"retailer_id": retailer_id, "search_id": search_id,
+                            "context": context, "page": page, "path": path}
+            from ..config import settings
+            return {"retailer_id": retailer_id, "search_id": search_id,
+                    "session_state": "active", "viewer_url": settings.vnc_url}
+
+    async def complete(self, retailer_id: str, search_id: str, *, challenge_cleared: bool | None) -> dict:
+        async with self._lock:
+            active = self._active
+            if not active or active["retailer_id"] != retailer_id or active["search_id"] != search_id:
+                raise RuntimeError("No matching retailer session is active")
+            # ``None`` is allowed for a retailer that only showed a consent
+            # page; visible verification text is still checked below. An
+            # explicit negative acknowledgement can never save browser state.
+            if challenge_cleared is False:
+                raise ChallengeNotClearedError("The verification challenge is not cleared")
+            try:
+                body = await active["page"].locator("body").inner_text()
+                if detect_challenge(body):
+                    raise ChallengeNotClearedError("The verification challenge is not cleared")
+            except ChallengeNotClearedError:
+                raise
+            except Exception:
+                # A test double or a retailer that replaces the page is still
+                # allowed when the UI has explicitly confirmed completion.
+                pass
+            path = active["path"]
+            await active["context"].storage_state(path=str(path))
+            os.chmod(path, 0o600)
+            await self.pool.release(active["context"])
+            self._active = None
+            return {"retailer_id": retailer_id, "session_state": "active", "storage_path": str(path)}
+
+    async def reset(self, retailer_id: str) -> None:
+        async with self._lock:
+            if self._active and self._active["retailer_id"] == retailer_id:
+                await self.pool.release(self._active["context"])
+                self._active = None
+            path = self.directory / f"{retailer_id}.json"
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+assisted_sessions = AssistedBrowserSessions()
 
 
 class BrowserMarketplaceAdapter(RetailerAdapter):
@@ -79,7 +240,7 @@ class BrowserMarketplaceAdapter(RetailerAdapter):
         self.pool = pool or browser_pool
 
     async def search(self, request: SearchRequest, *, bypass_cache: bool = False) -> list[Offer]:
-        query = request.query
+        query = canonical_query(request, include_brand=self.definition.kind in {"boutique", "marketplace"})
         search_url = self.definition.search_url.format(query=quote_plus(query))
 
         # Do not probe browser-backed storefronts with the shared HTTP client.
@@ -88,7 +249,13 @@ class BrowserMarketplaceAdapter(RetailerAdapter):
         # prevents Chromium from ever getting a chance to load the storefront.
         context = None
         try:
-            context = await self.pool.context()
+            from ..config import settings
+            saved_state = settings.browser_sessions_dir / f"{self.definition.id}.json"
+            try:
+                usable_state = saved_state.exists() and assisted_sessions.state_for(self.definition.id) == "active"
+                context = await self.pool.context(str(saved_state) if usable_state else None)
+            except TypeError:
+                context = await self.pool.context()
             await context.route(re.compile(r"\.(woff2?|mp4|webm)(\?|$)"), lambda route: route.abort())
             page = await context.new_page()
             if self.definition.id == "foot_locker":
@@ -107,32 +274,63 @@ class BrowserMarketplaceAdapter(RetailerAdapter):
                     f"{self.definition.name} presented a verification challenge",
                     reason_code="verification_challenge", circuit_state="open",
                 )
-            selector = PRODUCT_LINK_SELECTORS[self.definition.id]
-            links = await page.locator(selector).evaluate_all(
-                "els => [...new Set(els.map(e => e.href).filter(Boolean))].slice(0, 6)"
+            selector = PRODUCT_LINK_SELECTORS.get(
+                self.definition.id,
+                'a[href*="/product"],a[href*="/products/"],a[href*="/p/"]',
             )
+            cards = await page.locator(selector).evaluate_all(
+                "els => els.map(e => ({href:e.href, text:(e.innerText || e.getAttribute('aria-label') || '')})).filter(x => x.href).slice(0, 12)"
+            )
+            query_words = set(canonical_query(request, include_brand=False).split())
+            links: list[str] = []
+            for card in cards:
+                link = card if isinstance(card, str) else card.get("href")
+                card_text = "" if isinstance(card, str) else str(card.get("text") or "").lower()
+                # Empty card text is retained because many retailer cards put
+                # the title in a client-rendered child that is not available at
+                # this point.  Otherwise require at least one canonical token.
+                if link and (not card_text or any(word in card_text for word in query_words)) and link not in links:
+                    links.append(link)
             if not links:
-                if re.search(r"no (?:products|results|matches)|0 results", body, re.I):
+                if re.search(r"no (?:products|results|matches)|0 (?:products|results)|nothing found", body, re.I):
                     return []
                 raise AdapterError(
                     f"{self.definition.name} returned an unrecognized catalog shell",
                     reason_code="catalog_shell",
                 )
-            offers: list[Offer] = []
-            for link in links[:4]:
-                response = await page.goto(link, wait_until="domcontentloaded", timeout=10_000)
-                if response and response.status == 404:
-                    continue
-                await page.wait_for_timeout(500)
-                text = await page.locator("body").inner_text()
-                if detect_challenge(text):
-                    raise RetailerBlockedError(
-                        f"{self.definition.name} presented a verification challenge",
-                        reason_code="verification_challenge", circuit_state="open",
-                    )
-                offer = await self._extract_product(page, request, link)
-                if offer:
-                    offers.append(offer)
+            # Detail requests are bounded and deliberately limited to two
+            # concurrent pages so a marketplace cannot turn one search into a
+            # burst of requests.
+            detail_sem = asyncio.Semaphore(2)
+            async def collect_detail(link: str) -> Offer | None:
+                async with detail_sem:
+                    detail_page = await context.new_page()
+                    try:
+                        response = await detail_page.goto(link, wait_until="domcontentloaded", timeout=10_000)
+                        if response and response.status == 404:
+                            return None
+                        await detail_page.wait_for_timeout(500)
+                        text = await detail_page.locator("body").inner_text()
+                        if detect_challenge(text):
+                            raise RetailerBlockedError(
+                                f"{self.definition.name} presented a verification challenge",
+                                reason_code="verification_challenge", circuit_state="open",
+                            )
+                        return await self._extract_product(detail_page, request, link)
+                    finally:
+                        await detail_page.close()
+            batches = await asyncio.gather(*(collect_detail(link) for link in links[:8]), return_exceptions=True)
+            if any(isinstance(item, RetailerBlockedError) for item in batches):
+                raise next(item for item in batches if isinstance(item, RetailerBlockedError))
+            offers = [item for item in batches if isinstance(item, Offer)]
+            failures = [item for item in batches if isinstance(item, Exception)]
+            if failures and offers:
+                raise PartialResultError(
+                    f"{self.definition.name}: {len(failures)} of {len(batches)} products could not be collected",
+                    offers=offers, reason_code="partial_results",
+                )
+            if failures:
+                raise failures[0]
             if links and not offers:
                 raise AdapterError(
                     f"{self.definition.name} product extraction failed",
@@ -140,7 +338,9 @@ class BrowserMarketplaceAdapter(RetailerAdapter):
                 )
             return offers
         except PlaywrightTimeoutError as exc:
-            raise AdapterError(f"{self.definition.name} browser page timed out") from exc
+            raise AdapterError(
+                f"{self.definition.name} browser page timed out", reason_code="retailer_timeout"
+            ) from exc
         except Exception as exc:
             if isinstance(exc, AdapterError):
                 raise
@@ -178,28 +378,90 @@ class BrowserMarketplaceAdapter(RetailerAdapter):
         data = await page.evaluate(r"""(size) => {
           const text = document.body?.innerText || '';
           const prop = name => document.querySelector(`meta[property="${name}"]`)?.content || '';
+          const item = name => document.querySelector(`[itemprop="${name}"]`)?.content || document.querySelector(`[itemprop="${name}"]`)?.innerText || '';
           const named = name => document.querySelector(`meta[name="${name}"]`)?.content || '';
           const h1 = document.querySelector('h1')?.innerText?.trim() || prop('og:title') || document.title;
           const candidates = [...document.querySelectorAll('button,[role="button"],li,[data-size],span')]
             .filter(e => (e.innerText || e.dataset?.size || '').trim().match(new RegExp('^(UK\\s*)?' + size.replace('.', '\\.') + '$', 'i')));
           const inStock = candidates.some(e => !e.disabled && e.getAttribute('aria-disabled') !== 'true' &&
             !/sold|disable|unavailable|out.of.stock/i.test(`${e.className} ${e.parentElement?.className || ''}`));
-          const json = [...document.querySelectorAll('script[type="application/ld+json"]')].map(e => e.textContent).join('\n');
-          return { text, name:h1, image:prop('og:image'), price:prop('product:price:amount') || named('twitter:data1'), inStock, json };
+          const json = [...document.querySelectorAll('script[type="application/ld+json"]')].map(e => e.textContent);
+          return { text, name:h1, image:prop('og:image'), price:prop('product:price:amount') || named('twitter:data1'), inStock, json,
+            category: prop('product:category') || item('category'), department: named('department') || item('audience') };
         }""", normalize_size(request.uk_size))
         return self._offer_from_snapshot(data, request, url)
 
     def _offer_from_snapshot(self, data: dict, request: SearchRequest, url: str) -> Offer | None:
         text, name = data.get("text", ""), data.get("name", "")
+        structured: dict = {}
+        raw_json = data.get("json")
+        if raw_json:
+            try:
+                decoded = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+                if isinstance(decoded, list):
+                    nodes = []
+                    for item in decoded:
+                        if isinstance(item, str):
+                            try:
+                                item = json.loads(item)
+                            except (TypeError, ValueError):
+                                continue
+                        nodes.append(item)
+                else:
+                    nodes = [decoded]
+                def product_node(node):
+                    if isinstance(node, dict):
+                        node_type = node.get("@type")
+                        if node_type == "Product" or (isinstance(node_type, list) and "Product" in node_type):
+                            return node
+                        for child_key in ("@graph", "item", "itemListElement"):
+                            found = product_node(node.get(child_key))
+                            if found:
+                                return found
+                    elif isinstance(node, list):
+                        for child in node:
+                            found = product_node(child)
+                            if found:
+                                return found
+                    return {}
+                structured = next((found for found in (product_node(node) for node in nodes) if found), {})
+            except (TypeError, ValueError, json.JSONDecodeError):
+                structured = {}
+        structured_offers = structured.get("offers") if isinstance(structured, dict) else {}
+        if isinstance(structured_offers, list):
+            structured_offers = structured_offers[0] if structured_offers else {}
+        if not isinstance(structured_offers, dict):
+            structured_offers = {}
+        currency = str(structured_offers.get("priceCurrency", "INR")).upper()
+        if currency not in {"INR", "RS", "₹"}:
+            return None
+        name = name or str(structured.get("name") or "")
         price_matches = re.findall(r"(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.\d{1,2})?)", text, re.I)
-        raw_price = data.get("price") or (price_matches[0] if price_matches else None)
+        raw_price = data.get("price") or structured_offers.get("price") or structured_offers.get("lowPrice") or (price_matches[0] if price_matches else None)
         if not name or raw_price is None:
             return None
         listed = parse_inr_paise(raw_price)
-        brand = "Converse" if "converse" in (name + " " + text[:500]).lower() else request.brand
+        structured_brand = structured.get("brand")
+        if isinstance(structured_brand, dict):
+            structured_brand = structured_brand.get("name")
+        structured_image = structured.get("image")
+        if isinstance(structured_image, list):
+            structured_image = structured_image[0] if structured_image else None
+        if isinstance(structured_image, dict):
+            structured_image = structured_image.get("url")
+        mentioned = recognized_brands(str(structured_brand or "") + " " + name + " " + text[:500])
+        canonical = next(iter(mentioned)) if len(mentioned) == 1 else None
+        brand = request.brand or (canonical.title() if canonical else None)
+        if canonical == "new balance":
+            brand = "New Balance"
+        elif canonical == "onitsuka tiger":
+            brand = "Onitsuka Tiger"
         colour_match = re.search(r"\b(black|white|grey|gray|red|green|navy|blue|pink|beige|brown)\b", name, re.I)
+        colourway = structured.get("color") or (colour_match.group(1).title() if colour_match else None)
         seller_match = re.search(r"Sold By\s*\n?([^\n]+)", text, re.I)
         style_match = re.search(r"(?:style|product)\s*(?:code|id)?\s*[:#-]?\s*([A-Z0-9-]{5,})", text, re.I)
+        structured_code = structured.get("sku") or structured.get("mpn")
+        style_code = style_match.group(1) if style_match else (structured_code or url.rstrip("/").split("/")[-1].split("?")[0])
         conditional: list[ConditionalOffer] = []
         coupon = re.search(r"(?:Use Code|Get it for)\s*\n?([^\n]{2,80})", text, re.I)
         if coupon:
@@ -207,9 +469,11 @@ class BrowserMarketplaceAdapter(RetailerAdapter):
         return Offer(
             retailer=self.definition.name, seller=seller_match.group(1).strip() if seller_match else None,
             product_name=name, brand=brand, model=name,
-            colourway=colour_match.group(1).title() if colour_match else None,
-            image_url=data.get("image") or None,
-            style_code=style_match.group(1) if style_match else url.rstrip("/").split("/")[-1].split("?")[0],
+            colourway=colourway,
+            category=classify_category(category=data.get("category") or structured.get("category"), title=name, url=url),
+            department=extract_department(department=data.get("department") or structured.get("gender") or structured.get("audience"), title=name, url=url),
+            image_url=data.get("image") or structured_image or None,
+            style_code=str(style_code) if style_code else None,
             requested_uk_size=normalize_size(request.uk_size), size_available=bool(data.get("inStock")),
             listed_price_paise=listed, automatic_discount_paise=0, shipping_paise=None,
             effective_price_paise=effective_price(listed), conditional_offers=conditional,
@@ -224,6 +488,9 @@ class BrowserMarketplaceAdapter(RetailerAdapter):
         text = soup.get_text("\n", strip=True)
         title = soup.select_one("h1")
         image = soup.select_one('meta[property="og:image"]')
+        category_meta = soup.select_one('meta[property="product:category"],meta[itemprop="category"],*[itemprop="category"]')
+        department_meta = soup.select_one('meta[name="department"],meta[itemprop="audience"],*[itemprop="audience"]')
+        ld_json = [node.get_text() for node in soup.select('script[type="application/ld+json"]')]
         size = normalize_size(request.uk_size)
         candidates = soup.select("[data-size],button,li")
         available = any(
@@ -236,5 +503,8 @@ class BrowserMarketplaceAdapter(RetailerAdapter):
         offer = self._offer_from_snapshot({
             "text": text, "name": title.get_text(" ", strip=True) if title else "",
             "image": image.get("content") if image else None, "inStock": available,
+            "category": (category_meta.get("content") if category_meta and category_meta.has_attr("content") else category_meta.get_text(" ", strip=True) if category_meta else None),
+            "department": (department_meta.get("content") if department_meta and department_meta.has_attr("content") else department_meta.get_text(" ", strip=True) if department_meta else None),
+            "json": ld_json,
         }, request, source_url)
         return [offer] if offer else []

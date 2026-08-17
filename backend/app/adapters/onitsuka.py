@@ -13,11 +13,11 @@ from .base import (
     RetailerDefinition,
     shared_client,
 )
-from ..normalization import effective_price, normalize_size, normalize_text, parse_inr_paise
+from ..normalization import canonical_query, classify_category, effective_price, extract_department, normalize_size, normalize_text, parse_inr_paise
 from ..schemas import Offer, SearchRequest
 
 
-DETAIL_LIMIT = 6
+DETAIL_LIMIT = 8
 DETAIL_TIMEOUT_SECONDS = 5
 DETAIL_SEMAPHORE = asyncio.Semaphore(2)
 
@@ -42,11 +42,11 @@ class OnitsukaAdapter(RetailerAdapter):
         "Onitsuka Tiger India",
         "official",
         "https://www.onitsukatiger.com/in/en-in/catalogsearch/result/?q={query}",
-        adapter_type="onitsuka",
+        adapter_type="onitsuka", footwear_only_scope=True,
     )
 
     async def search(self, request: SearchRequest, *, bypass_cache: bool = False) -> list[Offer]:
-        search_url = self.definition.search_url.format(query=quote_plus(request.query))
+        search_url = self.definition.search_url.format(query=quote_plus(canonical_query(request, include_brand=False)))
         response = await shared_client.get(search_url)
         products = self.parse_catalog(response.text)
         products = self._strongest(products, request)[:DETAIL_LIMIT]
@@ -317,6 +317,8 @@ class OnitsukaAdapter(RetailerAdapter):
             brand="Onitsuka Tiger",
             model=str(catalog["name"]),
             colourway=str(colour) if colour else None,
+            category="footwear",
+            department=extract_department(gender=catalog.get("gender"), title=catalog.get("name"), url=cls._url(catalog)),
             image_url=str(image.get("url")) if isinstance(image, dict) and image.get("url") else None,
             style_code=str(catalog["sku"]),
             requested_uk_size=normalize_size(request.uk_size),
