@@ -15,6 +15,10 @@ class SearchRow(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     cache_key: Mapped[str] = mapped_column(String(64), index=True)
     request_json: Mapped[str] = mapped_column(Text)
+    resolved_query: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_search_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    rechecked_retailer_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    verification_attempt: Mapped[int] = mapped_column(Integer, default=0)
     state: Mapped[str] = mapped_column(String(20), default="running")
     cached: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -35,6 +39,8 @@ class AdapterRunRow(Base):
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     circuit_state: Mapped[str] = mapped_column(String(20), default="closed")
     source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    outcome: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    diagnostics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

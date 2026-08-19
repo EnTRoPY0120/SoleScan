@@ -5,7 +5,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from .base import AdapterError, RetailerAdapter, RetailerDefinition, build_search_url, shared_client
-from ..normalization import effective_price, normalize_size, parse_inr_paise
+from ..normalization import classify_category, effective_price, extract_department, normalize_size, parse_inr_paise
 from ..schemas import ConditionalOffer, Offer, SearchRequest
 
 
@@ -119,8 +119,14 @@ class StructuredDataAdapter(RetailerAdapter):
         if isinstance(seller, dict):
             seller = seller.get("name")
         shipping = raw_offer.get("shippingDetails", {}).get("shippingRate", {}).get("value") if isinstance(raw_offer.get("shippingDetails"), dict) else None
-        shipping_paise = parse_inr_paise(shipping) if shipping is not None else None
-        auto_discount = parse_inr_paise(product.get("automaticDiscount", 0))
+        try:
+            shipping_paise = parse_inr_paise(shipping) if shipping is not None else None
+        except ValueError:
+            shipping_paise = None
+        try:
+            auto_discount = parse_inr_paise(product.get("automaticDiscount", 0))
+        except ValueError:
+            auto_discount = 0
         conditional: list[ConditionalOffer] = []
         for promo in product.get("conditionalOffers", []):
             if isinstance(promo, dict) and promo.get("description"):
@@ -132,6 +138,16 @@ class StructuredDataAdapter(RetailerAdapter):
             brand=str(brand) if brand else None,
             model=product.get("model"),
             colourway=product.get("color"),
+            category=classify_category(
+                category=product.get("category"), product_type=product.get("productType"),
+                breadcrumbs=product.get("categoryPath") or product.get("breadcrumbs") or (),
+                tags=product.get("tags") or (), title=product.get("name"), url=product.get("url") or source_url,
+            ),
+            department=extract_department(
+                department=product.get("department"), gender=product.get("gender"),
+                breadcrumbs=product.get("categoryPath") or product.get("breadcrumbs") or (),
+                tags=product.get("tags") or (), title=product.get("name"), url=product.get("url") or source_url,
+            ),
             image_url=str(image) if image else None,
             style_code=product.get("sku") or product.get("mpn"),
             requested_uk_size=requested_size,
@@ -147,3 +163,18 @@ class StructuredDataAdapter(RetailerAdapter):
             match_score=0,
             last_checked=datetime.now(timezone.utc),
         )
+
+
+class FirstPartyCatalogAdapter(StructuredDataAdapter):
+    """First-party storefront catalog collector.
+
+    Nike, adidas, and ASICS expose different JSON/GraphQL shells in practice;
+    the shared parser handles schema.org fallbacks while this adapter keeps the
+    catalog/detail boundary explicit and bounded for contract fixtures.
+    """
+
+    async def search(self, request: SearchRequest, *, bypass_cache: bool = False) -> list[Offer]:
+        response = await shared_client.get(build_search_url(self.definition.search_url, request))
+        # First-party pages may return an empty ItemList; parse() distinguishes
+        # that valid zero-result response from an unrecognized shell.
+        return self.parse(response.text, request, str(response.url))[:8]

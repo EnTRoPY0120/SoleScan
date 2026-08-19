@@ -7,7 +7,7 @@ from urllib.parse import quote_plus, urljoin, urlsplit
 from bs4 import BeautifulSoup
 
 from .base import AdapterError, RetailerAdapter, RetailerDefinition, shared_client
-from ..normalization import effective_price, normalize_size
+from ..normalization import canonical_query, classify_category, effective_price, extract_department, normalize_size
 from ..schemas import Offer, SearchRequest
 
 
@@ -17,16 +17,16 @@ class BrandmanAdapter(RetailerAdapter):
     definition = RetailerDefinition(
         "new_balance", "New Balance · Brandman", "official",
         "https://brandmanretail.com/search?q={query}&type=product",
-        adapter_type="brandman"
+        adapter_type="brandman", footwear_only_scope=True
     )
 
     async def search(self, request: SearchRequest, *, bypass_cache: bool = False) -> list[Offer]:
         # Brandman carries several brands, but the adapter filters product JSON
         # to New Balance. Searching only the model avoids Shopify's broad OR
         # matching for the redundant "New Balance" tokens.
-        search_url = f"https://brandmanretail.com/search/suggest.json?q={quote_plus(request.query)}&resources[type]=product&resources[limit]=6"
+        search_url = f"https://brandmanretail.com/search/suggest.json?q={quote_plus(canonical_query(request, include_brand=False))}&resources[type]=product&resources[limit]=6"
         response = await shared_client.get(search_url)
-        links = self.parse_suggestions(response.text)[:6]
+        links = self.parse_suggestions(response.text)[:12]
         semaphore = asyncio.Semaphore(2)
 
         async def collect(link: str) -> Offer | None:
@@ -35,7 +35,7 @@ class BrandmanAdapter(RetailerAdapter):
                 product = await shared_client.get(f"{product_url}.js")
             return self.parse_product(product.text, request, product_url)
 
-        results = await asyncio.gather(*(collect(link) for link in links), return_exceptions=True)
+        results = await asyncio.gather(*(collect(link) for link in links[:8]), return_exceptions=True)
         offers = [offer for offer in results if isinstance(offer, Offer)]
         failures = sum(isinstance(item, Exception) for item in results)
         if failures and offers:
@@ -130,6 +130,8 @@ class BrandmanAdapter(RetailerAdapter):
             retailer=self.definition.name, seller="Brandman Retail Ltd",
             product_name=str(product["title"]), brand="New Balance", model=str(product["title"]),
             colourway=str(colour) if colour else None,
+            category=classify_category(title=product["title"], tags=product.get("tags") or (), url=product_url),
+            department=extract_department(title=product["title"], tags=product.get("tags") or (), url=product_url),
             image_url=urljoin(product_url, str(image)) if image else None,
             style_code=style_code, requested_uk_size=requested,
             size_available=bool(chosen and chosen.get("available")), listed_price_paise=compared,

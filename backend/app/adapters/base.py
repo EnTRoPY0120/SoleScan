@@ -5,13 +5,14 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 import random
 import time
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Mapping
 from urllib.parse import quote_plus
 
 import httpx
 from bs4 import BeautifulSoup
 
 from ..config import settings
+from ..normalization import canonical_query
 from ..schemas import Offer, SearchRequest
 
 
@@ -26,12 +27,33 @@ class AdapterError(RuntimeError):
         http_status: int | None = None,
         retry_count: int = 0,
         circuit_state: str = "closed",
+        diagnostics: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__(message)
         self.reason_code = reason_code
         self.http_status = http_status
         self.retry_count = retry_count
         self.circuit_state = circuit_state
+        self.diagnostics = sanitize_diagnostics(diagnostics or {})
+
+
+DIAGNOSTIC_KEYS = {
+    "attempt", "error_type", "final_url", "http_status", "net_error",
+    "operation", "redirect_count", "stage", "transport",
+}
+
+
+def sanitize_diagnostics(values: Mapping[str, object]) -> dict[str, str | int | bool | None]:
+    """Keep a small failure-only diagnostic envelope with no bodies or credentials."""
+    sanitized: dict[str, str | int | bool | None] = {}
+    for key, value in values.items():
+        if key not in DIAGNOSTIC_KEYS or isinstance(value, (dict, list, tuple, set)):
+            continue
+        if value is None or isinstance(value, (int, bool)):
+            sanitized[key] = value
+        else:
+            sanitized[key] = str(value)[:300]
+    return sanitized
 
 
 class RetailerBlockedError(AdapterError):
@@ -73,6 +95,11 @@ class RetailerDefinition:
     uses_browser: bool = False
     adapter_type: str | None = None  # "shopify", "browser", "structured", "puma", "converse", "brandman", "vegnonveg"
     collection_mode: str = "automatic"
+    # An unknown product category may only pass the domain filter when the
+    # collector's contract is explicitly footwear-only.  Multi-category
+    # storefronts must provide category evidence in each offer instead.
+    footwear_only_scope: bool = False
+    session_capable: bool = False
 
 
 class RetailerAdapter(ABC):
@@ -312,7 +339,8 @@ class RateLimitedClient:
 shared_client = RateLimitedClient()
 
 
-def build_search_url(template: str, request: SearchRequest) -> str:
-    # Brand and colour remain downstream match filters. Store search engines get
-    # the model exactly once, which avoids broad OR matching and duplicate tokens.
-    return template.format(query=quote_plus(request.query))
+def build_search_url(template: str, request: SearchRequest, *, include_brand: bool = False) -> str:
+    # Use one canonical query token stream. Official single-brand stores can
+    # omit the brand; marketplaces and boutiques pass include_brand=True.
+    query = canonical_query(request, include_brand=include_brand)
+    return template.format(query=quote_plus(query))

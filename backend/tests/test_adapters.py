@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from app.adapters.base import AdapterError, detect_challenge
+from app.adapters.asics import AsicsAdapter
 from app.adapters.brandman import BrandmanAdapter
 from app.adapters.registry import ADAPTERS, DEFINITIONS
 from app.adapters.browser import BrowserMarketplaceAdapter
@@ -19,7 +20,7 @@ FIXTURES = json.loads((Path(__file__).parent / "fixtures" / "retailer_products.j
 
 @pytest.mark.parametrize("adapter", ADAPTERS, ids=lambda item: item.definition.id)
 def test_every_retailer_fixture_contract(adapter):
-    if isinstance(adapter, (BrandmanAdapter, ConverseAdapter, PumaAdapter, ShopifyCatalogAdapter, VegNonVegAdapter, BrowserMarketplaceAdapter)):
+    if isinstance(adapter, (AsicsAdapter, BrandmanAdapter, ConverseAdapter, PumaAdapter, ShopifyCatalogAdapter, VegNonVegAdapter, BrowserMarketplaceAdapter)):
         pytest.skip("covered by source-specific parser tests")
     payload = FIXTURES[adapter.definition.id]
     if payload == "@nike": payload = FIXTURES["nike"]

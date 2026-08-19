@@ -1,8 +1,9 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import '@fontsource-variable/manrope';
   import ResultsSection from '$lib/components/ResultsSection.svelte';
   import SearchForm from '$lib/components/SearchForm.svelte';
-  import { beginSearch, brandConflict, connectSearchEvents, inputMatchesRequest, loadSearch, validateSearch, type SearchInput } from '$lib/search';
+  import { beginSearch, closeRetailerSession, completeRetailerSession, connectSearchEvents, forgetRetailerSession, inputMatchesRequest, loadSearch, startRetailerSession, validateSearch, type SearchInput } from '$lib/search';
   import type { Offer, RetailerStatus, SearchResult } from '$lib/types';
 
   let query = '';
@@ -15,20 +16,30 @@
   let error = '';
   let searchId = '';
   let offers: Offer[] = [];
-  let weak: Offer[] = [];
   let retailers: RetailerStatus[] = [];
   let cached = false;
   let events: ReturnType<typeof connectSearchEvents> | null = null;
   let displayedRequest: SearchResult['request'] | null = null;
-  let continueAnyway = false;
-  let confirmationKey = '';
-
-  $: inputKey = JSON.stringify(input());
-  $: if (confirmationKey && inputKey !== confirmationKey) {
-    continueAnyway = false;
-    confirmationKey = '';
-  }
+  let resolvedQuery: string | null = null;
+  let recheckedRetailerId: string | null = null;
+  let verificationAttempt = 0;
+  let activeRetailerId = '';
+  let activeSessionExpiresAt = 0;
+  let activeViewer: Window | null = null;
+  let nowSeconds = Math.floor(Date.now() / 1000);
+  let recoveringSession = false;
   $: inputsChanged = Boolean(displayedRequest && !inputMatchesRequest(input(), displayedRequest));
+  $: sessionSecondsRemaining = activeRetailerId ? Math.max(0, Math.ceil(activeSessionExpiresAt - nowSeconds)) : 0;
+
+  onMount(() => {
+    const timer = window.setInterval(() => {
+      nowSeconds = Math.floor(Date.now() / 1000);
+      if (!activeRetailerId || recoveringSession) return;
+      if (activeSessionExpiresAt <= nowSeconds) void recoverSession('Verification session expired. Open it again.');
+      else if (activeViewer?.closed) void recoverSession('Verification window was closed without saving.');
+    }, 1000);
+    return () => window.clearInterval(timer);
+  });
 
   function input(): SearchInput {
     return { query, ukSize, brand, colourway, department, pinCode };
@@ -36,10 +47,12 @@
 
   function applyResult(result: SearchResult) {
     offers = result.offers;
-    weak = result.weak_matches;
     retailers = result.retailers;
     cached = result.cached;
     displayedRequest = result.request;
+    resolvedQuery = result.resolved_query;
+    recheckedRetailerId = result.rechecked_retailer_id;
+    verificationAttempt = result.verification_attempt;
     if (result.state === 'complete') searching = false;
   }
 
@@ -59,20 +72,8 @@
   }
 
   async function startSearch() {
-    if (!prepareSearch()) return;
-    const conflict = brandConflict(input());
-    if (conflict && !continueAnyway) {
-      error = `${conflict} Correct the inputs or continue anyway.`;
-      confirmationKey = inputKey;
-      return;
-    }
+    if (activeRetailerId || !prepareSearch()) return;
     await runSearch();
-  }
-
-  async function confirmConflict() {
-    continueAnyway = true;
-    error = '';
-    await startSearch();
   }
 
   function prepareSearch(): boolean {
@@ -84,15 +85,15 @@
     return cause instanceof Error ? cause.message : 'Search failed.';
   }
 
-  async function runSearch() {
+  async function runSearch(allowQueryCorrection = true) {
     searching = true;
     cached = false;
     offers = [];
-    weak = [];
     retailers = [];
+    resolvedQuery = null;
     events?.close();
     try {
-      const started = await beginSearch(input());
+      const started = await beginSearch(input(), '', allowQueryCorrection);
       searchId = started.id;
       cached = started.cached;
       await reload();
@@ -103,8 +104,14 @@
     }
   }
 
+  async function searchOriginal() {
+    if (!displayedRequest || searching || activeRetailerId) return;
+    query = displayedRequest.query;
+    await runSearch(false);
+  }
+
   async function refreshDisplayed() {
-    if (!searchId || searching) return;
+    if (!searchId || searching || activeRetailerId) return;
     searching = true;
     error = '';
     events?.close();
@@ -118,19 +125,83 @@
       searching = false;
     }
   }
+
+  async function connectRetailer(retailerId: string) {
+    if (!searchId || activeRetailerId) return;
+    // Open synchronously from the click handler so popup blockers do not
+    // discard the viewer while the API creates the assisted context.
+    const viewer = window.open('', 'sole-scan-assisted-retailer', 'popup,width=1280,height=900');
+    if (!viewer) throw new Error('Enable pop-ups for SoleScan, then open retailer verification again.');
+    try {
+      const session = await startRetailerSession(retailerId, searchId);
+      activeRetailerId = retailerId;
+      activeSessionExpiresAt = session.expires_at;
+      activeViewer = viewer;
+      viewer.location.href = session.viewer_url;
+      await reload();
+    } catch (cause) {
+      viewer.close();
+      throw cause;
+    }
+  }
+
+  async function completeRetailer(retailerId: string) {
+    if (!searchId || activeRetailerId !== retailerId) return;
+    events?.close();
+    const started = await completeRetailerSession(retailerId, searchId);
+    clearActiveSession();
+    searchId = started.id;
+    searching = true;
+    await reload();
+    watchEvents();
+  }
+
+  function clearActiveSession() {
+    activeViewer?.close();
+    activeViewer = null;
+    activeRetailerId = '';
+    activeSessionExpiresAt = 0;
+  }
+
+  async function closeRetailer(retailerId: string) {
+    await closeRetailerSession(retailerId);
+    clearActiveSession();
+    await reload();
+  }
+
+  async function forgetRetailer(retailerId: string) {
+    await forgetRetailerSession(retailerId);
+    await reload();
+  }
+
+  async function recoverSession(message: string) {
+    if (!activeRetailerId || recoveringSession) return;
+    recoveringSession = true;
+    const retailerId = activeRetailerId;
+    clearActiveSession();
+    error = message;
+    try {
+      await closeRetailerSession(retailerId);
+      await reload();
+    } catch {
+      // The server may already have expired the session; the local workflow is still cleared.
+    } finally {
+      recoveringSession = false;
+    }
+  }
 </script>
 
 <svelte:head><title>Indian Sneaker Price Finder</title><meta name="description" content="Compare sneaker prices and UK-size stock across Indian retailers." /></svelte:head>
 
 <header><a class="brand" href="/" aria-label="Sneaker Price Finder home"><span>SOLE</span><b>SCAN</b></a></header>
 <main>
-  <SearchForm bind:query bind:ukSize bind:brand bind:colourway bind:department bind:pinCode {searching} on:search={startSearch} />
-  <div class="alert" role="alert" hidden={!error}>{error}{#if confirmationKey && inputKey === confirmationKey}<button on:click={confirmConflict}>Continue anyway</button>{/if}</div>
-  <ResultsSection sectionOffers={offers} sectionWeak={weak} sectionRetailers={retailers} sectionSearching={searching} {cached} resultRequest={displayedRequest} {inputsChanged} visible={Boolean(searching || searchId)} canRefresh={Boolean(searchId && !searching)} refresh={refreshDisplayed} />
+  <SearchForm bind:query bind:ukSize bind:brand bind:colourway bind:department bind:pinCode {searching} verificationActive={Boolean(activeRetailerId)} on:search={startSearch} />
+  <div class="alert" role="alert" hidden={!error}>{error}</div>
+  <ResultsSection sectionOffers={offers} sectionRetailers={retailers} sectionSearching={searching} {cached} resultRequest={displayedRequest} {resolvedQuery} {searchOriginal} {inputsChanged} visible={Boolean(searching || searchId)} canRefresh={Boolean(searchId && !searching && !activeRetailerId)} refresh={refreshDisplayed} {searchId} {activeRetailerId} {sessionSecondsRemaining} {recheckedRetailerId} {verificationAttempt} connect={connectRetailer} complete={completeRetailer} closeSession={closeRetailer} forgetSession={forgetRetailer} />
   <aside class="disclaimer"><b>Before you buy</b><p>Prices, stock, shipping, seller status, returns, and coupon eligibility can change. Always reconfirm every detail on the retailer’s product and checkout pages.</p></aside>
 </main>
 <footer>Built for local, personal price comparison · INR only · No affiliate tracking</footer>
 
 <style>
-  :global(*){box-sizing:border-box}:global(body){margin:0;background:#f7f5ef;color:#111915;font-family:"Manrope Variable",Manrope,ui-sans-serif,sans-serif;font-size:16px;line-height:1.5;-webkit-font-smoothing:antialiased}:global(button),:global(input),:global(select){font:inherit;font-size:16px}:global(h1),:global(h2),:global(h3){font-family:inherit;font-weight:750}:global([hidden]){display:none!important}header{height:68px;padding:0 max(5vw,24px);display:flex;align-items:center;border-bottom:1px solid #d5d5cf;background:rgba(247,245,239,.96);position:sticky;top:0;z-index:5;backdrop-filter:blur(12px)}.brand{text-decoration:none;color:#111915;font-size:23px;letter-spacing:-1px}.brand span{font-weight:900}.brand b{font-weight:300}main{width:min(1280px,92vw);margin:auto}.alert{border-left:4px solid #cc412d;background:#fff0ed;padding:16px 20px;margin:22px 0}.alert button{margin-left:14px;border:1px solid #8c291b;background:#fff;padding:7px 10px;cursor:pointer}.disclaimer{display:flex;gap:32px;background:#172b22;color:#fff;padding:27px 32px;margin:38px 0 74px;border-radius:3px}.disclaimer b{white-space:nowrap}.disclaimer p{margin:0;color:#bdc8c2;line-height:1.55;font-size:15px}footer{text-align:center;border-top:1px solid #ccd0ca;padding:27px;color:#6c766f;font-size:12px;letter-spacing:1px;text-transform:uppercase}@media(max-width:820px){header{height:60px}.disclaimer{display:block}.disclaimer p{margin-top:11px}}@media(max-width:520px){main{width:min(94vw,1280px)}}
+  :global(*){box-sizing:border-box}:global(body){margin:0;background:#f7f5ef;color:#111915;font-family:"Manrope Variable",Manrope,ui-sans-serif,sans-serif;font-size:16px;line-height:1.5;-webkit-font-smoothing:antialiased}:global(button),:global(input),:global(select){font:inherit;font-size:16px}:global(h1),:global(h2),:global(h3){font-family:inherit;font-weight:750}:global([hidden]){display:none!important}header{height:68px;padding:0 max(5vw,24px);display:flex;align-items:center;border-bottom:1px solid #d5d5cf;background:rgba(247,245,239,.96);position:sticky;top:0;z-index:5;backdrop-filter:blur(12px)}.brand{text-decoration:none;color:#111915;font-size:23px;letter-spacing:-1px}.brand span{font-weight:900}.brand b{font-weight:300}main{width:min(1280px,92vw);margin:auto}.alert{border-left:4px solid #cc412d;background:#fff0ed;padding:16px 20px;margin:22px 0}.disclaimer{display:flex;gap:32px;background:#172b22;color:#fff;padding:27px 32px;margin:38px 0 74px;border-radius:3px}.disclaimer b{white-space:nowrap}.disclaimer p{margin:0;color:#bdc8c2;line-height:1.55;font-size:15px}footer{text-align:center;border-top:1px solid #ccd0ca;padding:27px;color:#6c766f;font-size:12px;letter-spacing:1px;text-transform:uppercase}@media(max-width:820px){header{height:60px}.disclaimer{display:block}.disclaimer p{margin-top:11px}}@media(max-width:520px){main{width:min(94vw,1280px)}}
 </style>

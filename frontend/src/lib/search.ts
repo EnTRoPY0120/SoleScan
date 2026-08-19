@@ -17,10 +17,11 @@ export function validateSearch(input: SearchInput): string {
   return '';
 }
 
-export function createSearchBody(input: SearchInput) {
+export function createSearchBody(input: SearchInput, allowQueryCorrection = true) {
   return {
     query: input.query.trim(),
     uk_size: input.ukSize.trim(),
+    allow_query_correction: allowQueryCorrection,
     brand: input.brand.trim() || null,
     colourway: input.colourway.trim() || null,
     department: input.department,
@@ -58,14 +59,16 @@ export function brandConflict(input: SearchInput): string {
 }
 
 export function inputMatchesRequest(input: SearchInput, request: SearchResult['request']): boolean {
-  return JSON.stringify(createSearchBody(input)) === JSON.stringify(request);
+  const { allow_query_correction: _inputMode, ...inputBody } = createSearchBody(input);
+  const { allow_query_correction: _requestMode, ...requestBody } = request;
+  return JSON.stringify(inputBody) === JSON.stringify(requestBody);
 }
 
-export async function beginSearch(input: SearchInput, refreshId = ''): Promise<{ id: string; cached: boolean }> {
+export async function beginSearch(input: SearchInput, refreshId = '', allowQueryCorrection = true): Promise<{ id: string; cached: boolean }> {
   const response = await fetch(refreshId ? `/api/search/${refreshId}/refresh` : '/api/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: refreshId ? undefined : JSON.stringify(createSearchBody(input))
+    body: refreshId ? undefined : JSON.stringify(createSearchBody(input, allowQueryCorrection))
   });
   return apiJson(response, 'Could not start the search.');
 }
@@ -73,6 +76,32 @@ export async function beginSearch(input: SearchInput, refreshId = ''): Promise<{
 export async function loadSearch(searchId: string): Promise<SearchResult> {
   const response = await fetch(`/api/search/${searchId}`);
   return apiJson(response, 'Could not load search results.');
+}
+
+export async function startRetailerSession(retailerId: string, searchId: string): Promise<{ viewer_url: string; expires_at: number; session_state: 'active' }> {
+  const response = await fetch(`/api/retailers/${encodeURIComponent(retailerId)}/session/start`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ search_id: searchId })
+  });
+  return apiJson(response, 'Could not open the assisted retailer session.');
+}
+
+export async function completeRetailerSession(retailerId: string, searchId: string): Promise<{ id: string; cached: boolean }> {
+  const response = await fetch(`/api/retailers/${encodeURIComponent(retailerId)}/session/complete`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ search_id: searchId, challenge_cleared: true })
+  });
+  return apiJson(response, 'Could not complete the assisted retailer session.');
+}
+
+export async function closeRetailerSession(retailerId: string): Promise<void> {
+  const response = await fetch(`/api/retailers/${encodeURIComponent(retailerId)}/session/active`, { method: 'DELETE' });
+  await apiJson(response, 'Could not close the verification window.');
+}
+
+export async function forgetRetailerSession(retailerId: string): Promise<void> {
+  const response = await fetch(`/api/retailers/${encodeURIComponent(retailerId)}/session`, { method: 'DELETE' });
+  await apiJson(response, 'Could not forget the retained verification.');
 }
 
 type EventSourceLike = {

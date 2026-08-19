@@ -4,7 +4,7 @@ import json
 from urllib.parse import quote_plus, urlencode, urljoin, urlsplit
 
 from .base import AdapterError, RetailerAdapter, RetailerDefinition, shared_client
-from ..normalization import effective_price, normalize_size
+from ..normalization import canonical_query, classify_category, effective_price, extract_department, normalize_size
 from ..schemas import Offer, SearchRequest
 
 
@@ -18,12 +18,12 @@ class ShopifyCatalogAdapter(RetailerAdapter):
 
     async def search(self, request: SearchRequest, *, bypass_cache: bool = False) -> list[Offer]:
         params = urlencode({
-            "q": request.query,
+            "q": canonical_query(request, include_brand=True),
             "resources[type]": "product",
             "resources[limit]": "6",
         })
         response = await shared_client.get(f"{self.origin}/search/suggest.json?{params}")
-        links = self.parse_suggestions(response.text)
+        links = self.parse_suggestions(response.text)[:12]
         semaphore = asyncio.Semaphore(2)
 
         async def collect(link: str) -> Offer | None:
@@ -32,7 +32,7 @@ class ShopifyCatalogAdapter(RetailerAdapter):
                 product_response = await shared_client.get(f"{product_url}.js")
             return self.parse_product(product_response.text, request, product_url)
 
-        results = await asyncio.gather(*(collect(link) for link in links[:6]), return_exceptions=True)
+        results = await asyncio.gather(*(collect(link) for link in links[:8]), return_exceptions=True)
         offers = [offer for offer in results if isinstance(offer, Offer)]
         failures = sum(isinstance(item, Exception) for item in results)
         if failures and offers:
@@ -132,6 +132,8 @@ class ShopifyCatalogAdapter(RetailerAdapter):
             retailer=self.definition.name, seller=self.definition.name,
             product_name=str(product["title"]), brand=brand, model=str(product["title"]),
             colourway=str(colour) if colour else None,
+            category=classify_category(title=product.get("title"), tags=product.get("tags") or (), url=product_url),
+            department=extract_department(title=product.get("title"), tags=product.get("tags") or (), url=product_url),
             image_url=urljoin(product_url, str(featured)) if featured else None,
             style_code=str((chosen or fallback).get("sku") or product.get("id") or "") or None,
             requested_uk_size=requested,
