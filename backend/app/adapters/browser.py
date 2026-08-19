@@ -136,6 +136,10 @@ class ChallengeNotClearedError(RuntimeError):
     pass
 
 
+class UnsafeSessionStateError(RuntimeError):
+    pass
+
+
 class AssistedBrowserSessions:
     """Single-user, single-retailer assisted browser session coordinator."""
 
@@ -145,6 +149,7 @@ class AssistedBrowserSessions:
         self.directory = Path(directory or settings.browser_sessions_dir)
         self.runtime = runtime or assisted_runtime
         self.idle_seconds = settings.assisted_session_idle_seconds
+        self.verified_state_seconds = settings.verified_state_ttl_seconds
         self._lock = asyncio.Lock()
         self._active: dict | None = None
         self._expiry_task: asyncio.Task | None = None
@@ -155,6 +160,12 @@ class AssistedBrowserSessions:
         path = self.directory / f"{retailer_id}.json"
         if not path.exists():
             return "none"
+        try:
+            if time.time() - path.stat().st_mtime >= self.verified_state_seconds:
+                path.unlink()
+                return "expired"
+        except OSError:
+            return "expired"
         try:
             payload = json.loads(path.read_text())
             if not isinstance(payload, dict):
@@ -169,7 +180,7 @@ class AssistedBrowserSessions:
                 return "expired"
         except (OSError, ValueError, TypeError):
             return "expired"
-        return "active"
+        return "retained"
 
     async def start(self, retailer_id: str, search_id: str, url: str) -> dict:
         async with self._lock:
@@ -182,7 +193,7 @@ class AssistedBrowserSessions:
             except OSError:
                 pass
             path = self.directory / f"{retailer_id}.json"
-            usable_state = path.exists() and self.state_for(retailer_id) == "active"
+            usable_state = path.exists() and self.state_for(retailer_id) == "retained"
             try:
                 context = await self.pool.assisted_context(str(path) if usable_state else None)
             except TypeError:
@@ -199,12 +210,15 @@ class AssistedBrowserSessions:
                 # permit indefinitely.
                 await self.pool.release(context)
                 raise
+            expires_at = time.time() + self.idle_seconds
             self._active = {"retailer_id": retailer_id, "search_id": search_id,
-                            "context": context, "page": page, "path": path}
+                            "context": context, "page": page, "path": path,
+                            "expires_at": expires_at}
             self._expiry_task = asyncio.create_task(self._expire_after(retailer_id, search_id))
             from ..config import settings
             return {"retailer_id": retailer_id, "search_id": search_id,
-                    "session_state": "active", "viewer_url": settings.vnc_url}
+                    "session_state": "active", "viewer_url": settings.vnc_url,
+                    "expires_at": expires_at}
 
     async def complete(self, retailer_id: str, search_id: str, *, challenge_cleared: bool | None) -> dict:
         async with self._lock:
@@ -218,21 +232,66 @@ class AssistedBrowserSessions:
                 raise ChallengeNotClearedError("The verification challenge is not cleared")
             try:
                 body = await active["page"].locator("body").inner_text()
+                current_url = str(getattr(active["page"], "url", ""))
+                if re.search(
+                    r"(?:/cdn-cgi/challenge|/challenge(?:[/?#]|$)|/captcha(?:[/?#]|$)|/verify(?:[/?#]|$))",
+                    current_url,
+                    re.I,
+                ):
+                    raise ChallengeNotClearedError(
+                        "The retailer is still showing a challenge URL"
+                    )
+                unsafe_url = re.search(
+                    r"/(?:login|sign-?in|account|cart|checkout)(?:[/?#]|$)",
+                    current_url,
+                    re.I,
+                )
+                unsafe_body = re.search(
+                    r"\b(?:my account|order history|proceed to checkout|sign out|log out)\b",
+                    body,
+                    re.I,
+                )
+                if unsafe_url or unsafe_body:
+                    await self.pool.release(active["context"])
+                    self._active = None
+                    self._cancel_expiry()
+                    try:
+                        active["path"].unlink()
+                    except FileNotFoundError:
+                        pass
+                    raise UnsafeSessionStateError(
+                        "Account or checkout activity cannot be saved; verification sessions are for consent screens only"
+                    )
                 if detect_challenge(body):
                     raise ChallengeNotClearedError("The verification challenge is not cleared")
-            except ChallengeNotClearedError:
+                selector = PRODUCT_LINK_SELECTORS.get(retailer_id)
+                product_count = await active["page"].locator(selector).count() if selector else 0
+                valid_empty = re.search(
+                    r"\b(?:no products|no results|no matches|nothing found|0 products|0 results)\b",
+                    body,
+                    re.I,
+                )
+                if product_count == 0 and not valid_empty:
+                    raise ChallengeNotClearedError(
+                        "The retailer catalog is not ready; finish verification in the open browser"
+                    )
+            except (ChallengeNotClearedError, UnsafeSessionStateError):
                 raise
-            except Exception:
-                # A test double or a retailer that replaces the page is still
-                # allowed when the UI has explicitly confirmed completion.
-                pass
+            except Exception as exc:
+                raise ChallengeNotClearedError(
+                    "The retailer catalog could not be verified; keep the browser open and try again"
+                ) from exc
             path = active["path"]
             await active["context"].storage_state(path=str(path))
             os.chmod(path, 0o600)
+            verified_until = time.time() + self.verified_state_seconds
             await self.pool.release(active["context"])
             self._active = None
             self._cancel_expiry()
-            return {"retailer_id": retailer_id, "session_state": "active", "storage_path": str(path)}
+            return {
+                "retailer_id": retailer_id, "session_state": "retained",
+                "storage_path": str(path), "verified_until": verified_until,
+            }
 
     async def reset(self, retailer_id: str) -> None:
         async with self._lock:
@@ -245,6 +304,14 @@ class AssistedBrowserSessions:
                 path.unlink()
             except FileNotFoundError:
                 pass
+
+    async def close(self, retailer_id: str) -> None:
+        """Close an unsaved viewer without deleting older verified state."""
+        async with self._lock:
+            if self._active and self._active["retailer_id"] == retailer_id:
+                await self.pool.release(self._active["context"])
+                self._active = None
+                self._cancel_expiry()
 
     async def _expire_after(self, retailer_id: str, search_id: str) -> None:
         try:
@@ -439,7 +506,7 @@ class BrowserMarketplaceAdapter(RetailerAdapter):
             from ..config import settings
             saved_state = settings.browser_sessions_dir / f"{self.definition.id}.json"
             try:
-                usable_state = saved_state.exists() and assisted_sessions.state_for(self.definition.id) == "active"
+                usable_state = saved_state.exists() and assisted_sessions.state_for(self.definition.id) == "retained"
                 context = await self.pool.context(str(saved_state) if usable_state else None)
             except TypeError:
                 context = await self.pool.context()

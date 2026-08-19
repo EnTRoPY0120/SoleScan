@@ -1,8 +1,9 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import '@fontsource-variable/manrope';
   import ResultsSection from '$lib/components/ResultsSection.svelte';
   import SearchForm from '$lib/components/SearchForm.svelte';
-  import { beginSearch, cancelRetailerSession, completeRetailerSession, connectSearchEvents, inputMatchesRequest, loadSearch, startRetailerSession, validateSearch, type SearchInput } from '$lib/search';
+  import { beginSearch, closeRetailerSession, completeRetailerSession, connectSearchEvents, forgetRetailerSession, inputMatchesRequest, loadSearch, startRetailerSession, validateSearch, type SearchInput } from '$lib/search';
   import type { Offer, RetailerStatus, SearchResult } from '$lib/types';
 
   let query = '';
@@ -20,7 +21,25 @@
   let events: ReturnType<typeof connectSearchEvents> | null = null;
   let displayedRequest: SearchResult['request'] | null = null;
   let resolvedQuery: string | null = null;
+  let recheckedRetailerId: string | null = null;
+  let verificationAttempt = 0;
+  let activeRetailerId = '';
+  let activeSessionExpiresAt = 0;
+  let activeViewer: Window | null = null;
+  let nowSeconds = Math.floor(Date.now() / 1000);
+  let recoveringSession = false;
   $: inputsChanged = Boolean(displayedRequest && !inputMatchesRequest(input(), displayedRequest));
+  $: sessionSecondsRemaining = activeRetailerId ? Math.max(0, Math.ceil(activeSessionExpiresAt - nowSeconds)) : 0;
+
+  onMount(() => {
+    const timer = window.setInterval(() => {
+      nowSeconds = Math.floor(Date.now() / 1000);
+      if (!activeRetailerId || recoveringSession) return;
+      if (activeSessionExpiresAt <= nowSeconds) void recoverSession('Verification session expired. Open it again.');
+      else if (activeViewer?.closed) void recoverSession('Verification window was closed without saving.');
+    }, 1000);
+    return () => window.clearInterval(timer);
+  });
 
   function input(): SearchInput {
     return { query, ukSize, brand, colourway, department, pinCode };
@@ -32,6 +51,8 @@
     cached = result.cached;
     displayedRequest = result.request;
     resolvedQuery = result.resolved_query;
+    recheckedRetailerId = result.rechecked_retailer_id;
+    verificationAttempt = result.verification_attempt;
     if (result.state === 'complete') searching = false;
   }
 
@@ -51,7 +72,7 @@
   }
 
   async function startSearch() {
-    if (!prepareSearch()) return;
+    if (activeRetailerId || !prepareSearch()) return;
     await runSearch();
   }
 
@@ -84,13 +105,13 @@
   }
 
   async function searchOriginal() {
-    if (!displayedRequest || searching) return;
+    if (!displayedRequest || searching || activeRetailerId) return;
     query = displayedRequest.query;
     await runSearch(false);
   }
 
   async function refreshDisplayed() {
-    if (!searchId || searching) return;
+    if (!searchId || searching || activeRetailerId) return;
     searching = true;
     error = '';
     events?.close();
@@ -106,37 +127,67 @@
   }
 
   async function connectRetailer(retailerId: string) {
-    if (!searchId) return;
+    if (!searchId || activeRetailerId) return;
     // Open synchronously from the click handler so popup blockers do not
     // discard the viewer while the API creates the assisted context.
     const viewer = window.open('', 'sole-scan-assisted-retailer', 'popup,width=1280,height=900');
+    if (!viewer) throw new Error('Enable pop-ups for SoleScan, then open retailer verification again.');
     try {
       const session = await startRetailerSession(retailerId, searchId);
-      if (viewer) viewer.location.href = session.viewer_url;
-      else window.open(session.viewer_url, 'sole-scan-assisted-retailer', 'popup,width=1280,height=900');
+      activeRetailerId = retailerId;
+      activeSessionExpiresAt = session.expires_at;
+      activeViewer = viewer;
+      viewer.location.href = session.viewer_url;
+      await reload();
     } catch (cause) {
-      viewer?.close();
+      viewer.close();
       throw cause;
     }
   }
 
   async function completeRetailer(retailerId: string) {
-    if (!searchId) return;
+    if (!searchId || activeRetailerId !== retailerId) return;
     events?.close();
-    try {
-      const started = await completeRetailerSession(retailerId, searchId);
-      searchId = started.id;
-      searching = true;
-      await reload();
-      watchEvents();
-    } catch (cause) {
-      throw cause;
-    }
+    const started = await completeRetailerSession(retailerId, searchId);
+    clearActiveSession();
+    searchId = started.id;
+    searching = true;
+    await reload();
+    watchEvents();
   }
 
-  async function cancelRetailer(retailerId: string) {
-    await cancelRetailerSession(retailerId);
+  function clearActiveSession() {
+    activeViewer?.close();
+    activeViewer = null;
+    activeRetailerId = '';
+    activeSessionExpiresAt = 0;
+  }
+
+  async function closeRetailer(retailerId: string) {
+    await closeRetailerSession(retailerId);
+    clearActiveSession();
     await reload();
+  }
+
+  async function forgetRetailer(retailerId: string) {
+    await forgetRetailerSession(retailerId);
+    await reload();
+  }
+
+  async function recoverSession(message: string) {
+    if (!activeRetailerId || recoveringSession) return;
+    recoveringSession = true;
+    const retailerId = activeRetailerId;
+    clearActiveSession();
+    error = message;
+    try {
+      await closeRetailerSession(retailerId);
+      await reload();
+    } catch {
+      // The server may already have expired the session; the local workflow is still cleared.
+    } finally {
+      recoveringSession = false;
+    }
   }
 </script>
 
@@ -144,9 +195,9 @@
 
 <header><a class="brand" href="/" aria-label="Sneaker Price Finder home"><span>SOLE</span><b>SCAN</b></a></header>
 <main>
-  <SearchForm bind:query bind:ukSize bind:brand bind:colourway bind:department bind:pinCode {searching} on:search={startSearch} />
+  <SearchForm bind:query bind:ukSize bind:brand bind:colourway bind:department bind:pinCode {searching} verificationActive={Boolean(activeRetailerId)} on:search={startSearch} />
   <div class="alert" role="alert" hidden={!error}>{error}</div>
-  <ResultsSection sectionOffers={offers} sectionRetailers={retailers} sectionSearching={searching} {cached} resultRequest={displayedRequest} {resolvedQuery} {searchOriginal} {inputsChanged} visible={Boolean(searching || searchId)} canRefresh={Boolean(searchId && !searching)} refresh={refreshDisplayed} {searchId} connect={connectRetailer} complete={completeRetailer} cancel={cancelRetailer} />
+  <ResultsSection sectionOffers={offers} sectionRetailers={retailers} sectionSearching={searching} {cached} resultRequest={displayedRequest} {resolvedQuery} {searchOriginal} {inputsChanged} visible={Boolean(searching || searchId)} canRefresh={Boolean(searchId && !searching && !activeRetailerId)} refresh={refreshDisplayed} {searchId} {activeRetailerId} {sessionSecondsRemaining} {recheckedRetailerId} {verificationAttempt} connect={connectRetailer} complete={completeRetailer} closeSession={closeRetailer} forgetSession={forgetRetailer} />
   <aside class="disclaimer"><b>Before you buy</b><p>Prices, stock, shipping, seller status, returns, and coupon eligibility can change. Always reconfirm every detail on the retailer’s product and checkout pages.</p></aside>
 </main>
 <footer>Built for local, personal price comparison · INR only · No affiliate tracking</footer>

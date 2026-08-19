@@ -15,12 +15,13 @@ export type RetailerStatus = {
   reason_code: string | null; http_status: number | null; retry_count: number; 
   circuit_state: 'closed' | 'open' | 'half_open';
   source: string | null; retry_at: string | null;
-  session_capable: boolean; session_state: 'none' | 'starting' | 'active' | 'expired';
+  session_capable: boolean; session_state: 'none' | 'starting' | 'active' | 'retained' | 'expired';
   outcome: 'offers_found' | 'valid_empty' | 'verification_required' | 'access_blocked' | 'contract_changed' | 'transport_failure' | 'internal_failure' | null;
 };
 export type SearchResult = {
   id: string; state: 'running' | 'complete'; offers: Offer[];
   retailers: RetailerStatus[]; cached: boolean; created_at: string; completed_at: string | null;
   resolved_query: string | null;
+  revision_of: string | null; rechecked_retailer_id: string | null; verification_attempt: number;
   request: { query: string; uk_size: string; allow_query_correction: boolean; brand: string | null; colourway: string | null; department: string; pin_code: string | null };
 };

@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 from app.adapters.base import RetailerAdapter, RetailerBlockedError, RetailerDefinition
 from app.db import init_db
@@ -138,6 +139,91 @@ async def test_shopper_can_search_the_original_text_without_correction():
 
     assert result.resolved_query is None
     assert adapter.seen_query == "onitsuka mexio 66"
+
+
+async def test_recheck_retailer_creates_a_revision_and_preserves_other_observations():
+    init_db()
+
+    class MutableAdapter(FakeAdapter):
+        def __init__(self, id, price):
+            super().__init__(id)
+            self.price = price
+            self.calls = 0
+
+        async def search(self, request, *, bypass_cache=False):
+            self.calls += 1
+            return [Offer(
+                retailer=self.definition.name,
+                product_name="Nike Air Jordan 1 Low", brand="Nike",
+                model="Air Jordan 1 Low", category="footwear",
+                requested_uk_size=request.uk_size, size_available=True,
+                listed_price_paise=self.price, shipping_paise=0,
+                effective_price_paise=self.price,
+                product_url=f"https://example.com/{self.definition.id}", match_score=0,
+                last_checked=datetime.now(timezone.utc),
+            )]
+
+    selected = MutableAdapter("selected", 900000)
+    untouched = MutableAdapter("untouched", 950000)
+    manager = SearchManager([selected, untouched])
+    original = await manager.create(
+        SearchRequest(query="Air Jordan 1 Low", brand="Nike", uk_size="9"),
+        bypass_cache=True,
+    )
+    original = await wait_complete(manager, str(original.id))
+    untouched_offer = next(offer for offer in original.offers if offer.retailer == "Untouched")
+    selected.price = 800000
+
+    revision = await manager.recheck_retailer(str(original.id), "selected")
+    revision = await wait_complete(manager, str(revision.id))
+
+    assert revision.revision_of == original.id
+    assert revision.rechecked_retailer_id == "selected"
+    assert revision.verification_attempt == 1
+    assert next(offer for offer in revision.offers if offer.retailer == "Selected").effective_price_paise == 800000
+    preserved = next(offer for offer in revision.offers if offer.retailer == "Untouched")
+    assert preserved.last_checked == untouched_offer.last_checked
+    assert (selected.calls, untouched.calls) == (2, 1)
+    assert [status.retailer_id for status in revision.retailers] == ["selected", "untouched"]
+    reloaded = SearchManager([selected, untouched]).get(str(revision.id))
+    assert reloaded.revision_of == original.id
+    assert reloaded.rechecked_retailer_id == "selected"
+    assert reloaded.verification_attempt == 1
+    other_revision = await manager.recheck_retailer(str(revision.id), "untouched")
+    other_revision = await wait_complete(manager, str(other_revision.id))
+    assert other_revision.rechecked_retailer_id == "untouched"
+    assert other_revision.verification_attempt == 1
+
+
+async def test_failed_verification_recheck_discards_state_before_manual_retry(tmp_path, monkeypatch):
+    from app.adapters.browser import assisted_sessions
+    init_db()
+
+    class ChallengeAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__("reebok")
+            self.definition = replace(self.definition, session_capable=True)
+
+        async def search(self, request, *, bypass_cache=False):
+            raise RetailerBlockedError(
+                "Verification is still required", reason_code="verification_challenge"
+            )
+
+    monkeypatch.setattr(assisted_sessions, "directory", tmp_path)
+    retained = Path(tmp_path) / "reebok.json"
+    retained.write_text('{"cookies": []}')
+    manager = SearchManager([ChallengeAdapter()])
+    original = await manager.create(
+        SearchRequest(query="Reebok Club C 85", uk_size="9"), bypass_cache=True,
+    )
+    original = await wait_complete(manager, str(original.id))
+
+    revision = await manager.recheck_retailer(str(original.id), "reebok")
+    revision = await wait_complete(manager, str(revision.id))
+
+    assert revision.retailers[0].outcome == "verification_required"
+    assert revision.retailers[0].session_state == "none"
+    assert not retained.exists()
 
 async def test_retailer_timeout_is_partial_failure():
     manager = SearchManager([FakeAdapter("fast"), FakeAdapter("slow", delay=.3)])

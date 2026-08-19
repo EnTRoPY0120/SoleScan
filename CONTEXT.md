@@ -12,6 +12,10 @@ _Avoid_: User, customer
 A coverage-aware view of retailer checks for one sneaker and requested size, with exact purchasable offers ranked by delivered total and possible, stale, or unavailable results shown separately.
 _Avoid_: Search results
 
+**Comparison revision**:
+A new comparison derived from an earlier comparison by replacing one retailer's observation while preserving the other retailer observations and their original times.
+_Avoid_: Mutated comparison, full refresh
+
 **Sneaker**:
 A specific product identity distinguished by model or style code, colorway, and gender designation. Size is selected when comparing offers rather than defining a different sneaker.
 _Avoid_: Search result, listing
@@ -71,3 +75,7 @@ _Avoid_: Scrape, retailer status
 **Verification session**:
 A temporary assisted-browser session in which the shopper may clear retailer consent or anti-bot verification screens without entering retailer account credentials.
 _Avoid_: Retailer connection, login session
+
+**Verified retailer state**:
+Temporary browser state produced after a shopper clears a retailer verification screen and reused only to recheck that retailer. It is not proof of account authentication or permission to bypass further access controls.
+_Avoid_: Login, connected account, authenticated retailer

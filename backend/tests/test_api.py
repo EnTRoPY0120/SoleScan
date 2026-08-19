@@ -7,8 +7,8 @@ from uuid import uuid4
 
 from app.assisted_runtime import AssistedBrowserUnavailableError
 from app.db import init_db
-from app.main import app, database_unavailable, health, retailers, start_retailer_session
-from app.schemas import RetailerSessionStart, SearchRequest
+from app.main import app, close_retailer_session, complete_retailer_session, database_unavailable, health, retailers, start_retailer_session
+from app.schemas import RetailerSessionComplete, RetailerSessionStart, SearchRequest
 
 
 async def test_health_validation_and_contract():
@@ -67,3 +67,69 @@ async def test_assisted_session_endpoint_checks_runtime_and_returns_viewer(monke
         await start_retailer_session("reebok", RetailerSessionStart(search_id=search_id))
     assert caught.value.status_code == 503
     assert "Restart the app" in caught.value.detail
+
+
+async def test_completed_verification_rechecks_only_the_selected_retailer(monkeypatch):
+    from app import main as main_module
+
+    search_id = uuid4()
+    revision_id = uuid4()
+    monkeypatch.setattr(
+        main_module.manager, "get",
+        lambda _search_id: SimpleNamespace(request=SearchRequest(query="Club C", uk_size="9")),
+    )
+
+    async def complete_ok(retailer_id, actual_search_id, *, challenge_cleared):
+        assert (retailer_id, actual_search_id, challenge_cleared) == (
+            "reebok", str(search_id), True,
+        )
+
+    async def recheck(source_search_id, retailer_id):
+        assert (source_search_id, retailer_id) == (str(search_id), "reebok")
+        return SimpleNamespace(id=revision_id)
+
+    monkeypatch.setattr(main_module.assisted_sessions, "complete", complete_ok)
+    monkeypatch.setattr(main_module.manager, "recheck_retailer", recheck)
+
+    result = await complete_retailer_session(
+        "reebok", RetailerSessionComplete(search_id=search_id, challenge_cleared=True),
+    )
+
+    assert result == {"id": str(revision_id), "cached": False}
+
+
+async def test_verification_allows_only_one_manual_retry(monkeypatch):
+    from app import main as main_module
+
+    search_id = uuid4()
+    monkeypatch.setattr(
+        main_module.manager, "get",
+        lambda _search_id: SimpleNamespace(
+            request=SearchRequest(query="Club C", uk_size="9"),
+            resolved_query=None,
+            rechecked_retailer_id="reebok",
+            verification_attempt=2,
+        ),
+    )
+
+    with pytest.raises(HTTPException, match="retry limit") as caught:
+        await start_retailer_session("reebok", RetailerSessionStart(search_id=search_id))
+
+    assert caught.value.status_code == 409
+
+
+async def test_close_session_endpoint_does_not_forget_verified_state(monkeypatch):
+    from app import main as main_module
+
+    closed = []
+
+    async def close(retailer_id):
+        closed.append(retailer_id)
+
+    monkeypatch.setattr(main_module.assisted_sessions, "close", close)
+    monkeypatch.setattr(main_module.assisted_sessions, "state_for", lambda _retailer_id: "retained")
+
+    result = await close_retailer_session("reebok")
+
+    assert result == {"retailer_id": "reebok", "session_state": "retained"}
+    assert closed == ["reebok"]

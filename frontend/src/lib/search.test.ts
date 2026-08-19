@@ -1,5 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
-import { brandConflict, connectSearchEvents, createSearchBody, inputMatchesRequest, validateSearch, type SearchInput } from './search';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { brandConflict, closeRetailerSession, connectSearchEvents, createSearchBody, forgetRetailerSession, inputMatchesRequest, startRetailerSession, validateSearch, type SearchInput } from './search';
+
+afterEach(() => vi.unstubAllGlobals());
 
 const valid: SearchInput = {
   query: ' Speedcat OG ', ukSize: '9', brand: ' Puma ', colourway: '',
@@ -48,5 +50,27 @@ describe('search helpers', () => {
     expect(inputMatchesRequest(valid, request)).toBe(true);
     expect(inputMatchesRequest(valid, { ...request, allow_query_correction: false })).toBe(true);
     expect(inputMatchesRequest({ ...valid, ukSize: '10' }, request)).toBe(false);
+  });
+
+  it('keeps closing an active viewer separate from forgetting retained verification', async () => {
+    const json = { status: 200, headers: { 'Content-Type': 'application/json' } };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), json))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), json));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await closeRetailerSession('reebok');
+    await forgetRetailerSession('reebok');
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/retailers/reebok/session/active', { method: 'DELETE' });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/retailers/reebok/session', { method: 'DELETE' });
+  });
+
+  it('returns the verification deadline when a retailer viewer starts', async () => {
+    const payload = { viewer_url: '/viewer', expires_at: 1234, session_state: 'active' };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(payload), {
+      status: 200, headers: { 'Content-Type': 'application/json' }
+    })));
+    await expect(startRetailerSession('reebok', 'search-1')).resolves.toEqual(payload);
   });
 });

@@ -31,8 +31,9 @@ Runtime SQLite data and logs persist in the repository's `data/` and `logs/` dir
 - `GET /api/retailers` — configured source health
 - `GET /api/health` — readiness
 - `POST /api/retailers/{retailer_id}/session/start` — open a localhost-only assisted browser for a verification screen
-- `POST /api/retailers/{retailer_id}/session/complete` — save the user-cleared browser state and rerun the search
-- `DELETE /api/retailers/{retailer_id}/session` — remove the saved retailer browser state
+- `POST /api/retailers/{retailer_id}/session/complete` — validate and retain user-cleared browser state, then recheck only that retailer
+- `DELETE /api/retailers/{retailer_id}/session/active` — close the active viewer without deleting older retained state
+- `DELETE /api/retailers/{retailer_id}/session` — forget retained retailer verification state
 
 Prices are integer paise internally. Ranking uses list price minus automatic discount plus known shipping. Conditional promotions are disclosed but excluded. Unknown-shipping offers rank behind comparable known delivered totals.
 
@@ -42,7 +43,7 @@ Search interpretation corrects only a unique one-edit spelling mistake in an alp
 
 New Balance uses the searchable Indian catalog operated by its authorized Indian retailer, Brandman Retail, and is identified as **New Balance · Brandman** in source status. Brandman remains a separate retailer with links to its own product pages; it is not represented as a New Balance-owned website. Converse and ASICS use their storefront catalog APIs. Reebok, Foot Locker, AJIO, Myntra, and Nykaa Fashion prefer isolated browser contexts inside one shared Chromium process; if Chromium hits a protocol failure, Myntra can fall back to its public embedded search data. The remaining stores use ordinary pages and embedded structured data.
 
-All configured sources are attempted automatically. Collectors distinguish valid zero-result pages from timeouts, missing pages, and verification challenges. They do not bypass authentication, CAPTCHAs, access controls, or anti-bot restrictions, so genuine transient blocking appears as a concise per-retailer error. When a browser-backed retailer presents a challenge, the UI can open one isolated headful session through the localhost VNC viewer; users should clear only the visible consent/verification screen and never enter retailer credentials. Saved browser state is stored under `data/browser-sessions` with restrictive permissions.
+All configured sources are attempted automatically. Collectors distinguish valid zero-result pages from timeouts, missing pages, and verification challenges. They do not bypass authentication, CAPTCHAs, access controls, or anti-bot restrictions, so genuine transient blocking appears as a concise per-retailer error. When a browser-backed retailer presents a challenge, the UI can open one isolated headful session through the localhost VNC viewer for up to ten minutes; users should clear only the visible consent/verification screen and never enter retailer credentials. SoleScan refuses to save login, account, cart, checkout, recognizable challenge, or unrecognized catalog pages. A successful completion retains cookies and local storage for at most one hour, closes the viewer, and creates an immutable comparison revision that rechecks only the selected retailer. One explicit retry is allowed if that state does not carry over. Saved browser state is stored under `data/browser-sessions` with restrictive permissions and can be forgotten from the retailer card.
 
 Runtime databases, logs, caches, browser state, build output, and dependencies are ignored by Git. Logs record retailer IDs and error classes, never cookies or credentials.
 

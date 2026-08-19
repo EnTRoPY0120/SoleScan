@@ -117,7 +117,7 @@ class RetailerStatus(BaseModel):
     source: str | None = None
     retry_at: datetime | None = None
     session_capable: bool = False
-    session_state: Literal["none", "starting", "active", "expired"] = "none"
+    session_state: Literal["none", "starting", "active", "retained", "expired"] = "none"
     outcome: Literal[
         "offers_found", "valid_empty", "verification_required", "access_blocked",
         "contract_changed", "transport_failure", "internal_failure",
@@ -128,6 +128,9 @@ class SearchResult(BaseModel):
     id: UUID
     request: SearchRequest
     resolved_query: str | None = None
+    revision_of: UUID | None = None
+    rechecked_retailer_id: str | None = None
+    verification_attempt: int = 0
     state: Literal["running", "complete"]
     offers: list[Offer]
     retailers: list[RetailerStatus]
@@ -148,7 +151,7 @@ class RetailerInfo(BaseModel):
     paused: bool = False
     retry_at: datetime | None = None
     session_capable: bool = False
-    session_state: Literal["none", "starting", "active", "expired"] = "none"
+    session_state: Literal["none", "starting", "active", "retained", "expired"] = "none"
 
 
 class RetailerSessionStart(BaseModel):

@@ -7,6 +7,7 @@
   export let department = 'any';
   export let pinCode = '';
   export let searching = false;
+  export let verificationActive = false;
   const dispatch = createEventDispatcher<{ search: void }>();
 </script>
 
@@ -17,7 +18,7 @@
   <label>Colourway<input bind:value={colourway} placeholder="Black / White" /></label>
   <label>Department<select bind:value={department}><option value="any">Any</option><option value="men">Men</option><option value="women">Women</option><option value="kids">Kids</option></select></label>
   <label>PIN code<input bind:value={pinCode} placeholder="Optional" inputmode="numeric" maxlength="6" /></label>
-  <button class="search" disabled={searching}>{searching ? 'Checking stores…' : 'Search prices'} <span aria-hidden="true">→</span></button>
+  <button class="search" disabled={searching || verificationActive}>{verificationActive ? 'Verification in progress…' : searching ? 'Checking stores…' : 'Search prices'} <span aria-hidden="true">→</span></button>
 </form>
 
 <style>

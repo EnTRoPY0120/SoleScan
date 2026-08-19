@@ -127,6 +127,14 @@ async def start_retailer_session(retailer_id: str, body: RetailerSessionStart) -
         result = manager.get(str(body.search_id))
     except SearchNotFound as exc:
         raise HTTPException(status_code=404, detail="Search not found") from exc
+    if (
+        getattr(result, "rechecked_retailer_id", None) == retailer_id
+        and getattr(result, "verification_attempt", 0) >= 2
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Verification retry limit reached for this comparison",
+        )
     session_request = result.request.model_copy(
         update={"query": result.resolved_query or result.request.query}
     )
@@ -170,8 +178,8 @@ async def complete_retailer_session(retailer_id: str, body: RetailerSessionCompl
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     try:
-        refreshed = await manager.create(previous.request.model_copy(deep=True), bypass_cache=True)
-    except SearchNotFound as exc:
+        refreshed = await manager.recheck_retailer(str(body.search_id), retailer_id)
+    except (SearchNotFound, ValueError) as exc:
         raise HTTPException(status_code=404, detail="Search not found") from exc
     return {"id": str(refreshed.id), "cached": False}
 
@@ -182,6 +190,17 @@ async def clear_retailer_session(retailer_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Retailer not found")
     await assisted_sessions.reset(retailer_id)
     return {"retailer_id": retailer_id, "session_state": "none"}
+
+
+@app.delete("/api/retailers/{retailer_id}/session/active")
+async def close_retailer_session(retailer_id: str) -> dict:
+    if not _definition(retailer_id):
+        raise HTTPException(status_code=404, detail="Retailer not found")
+    await assisted_sessions.close(retailer_id)
+    return {
+        "retailer_id": retailer_id,
+        "session_state": assisted_sessions.state_for(retailer_id),
+    }
 
 
 @app.get("/api/search/{search_id}/events")

@@ -106,6 +106,116 @@ class SearchManager:
         task.add_done_callback(self._tasks.discard)
         return result
 
+    async def recheck_retailer(self, source_search_id: str, retailer_id: str) -> SearchResult:
+        source = self.get(source_search_id)
+        if source.state != "complete":
+            raise ValueError("The comparison is still running")
+        adapter = next((item for item in self.adapters if item.definition.id == retailer_id), None)
+        if adapter is None:
+            raise ValueError("Retailer not found")
+        execution_request = source.request.model_copy(
+            update={"query": source.resolved_query or source.request.query}
+        )
+        new_id = str(uuid4())
+        now = utcnow()
+        with SessionLocal() as db:
+            offer_rows = db.scalars(select(OfferRow).where(
+                OfferRow.search_id == source_search_id,
+                OfferRow.retailer_id != retailer_id,
+            )).all()
+            run_rows = db.scalars(select(AdapterRunRow).where(
+                AdapterRunRow.search_id == source_search_id,
+                AdapterRunRow.retailer_id != retailer_id,
+            )).all()
+        preserved_offers = [
+            Offer.model_validate_json(row.offer_json) for row in offer_rows if not row.weak
+        ]
+        pending = RetailerStatus(
+            retailer_id=retailer_id,
+            retailer=adapter.definition.name,
+            state="pending",
+            source=self._source_url(adapter.definition, execution_request),
+            session_capable=adapter.definition.session_capable,
+            session_state=self._session_state(retailer_id),
+        )
+        statuses = [
+            pending if item.retailer_id == retailer_id else item.model_copy(deep=True)
+            for item in source.retailers
+        ]
+        result = SearchResult(
+            id=UUID(new_id), request=source.request.model_copy(deep=True),
+            resolved_query=source.resolved_query, revision_of=source.id,
+            rechecked_retailer_id=retailer_id,
+            verification_attempt=(
+                source.verification_attempt + 1
+                if source.rechecked_retailer_id == retailer_id else 1
+            ),
+            state="running",
+            offers=preserved_offers, retailers=statuses, created_at=now,
+        )
+        self._results[new_id] = result
+        revision_key = hashlib.sha256(
+            f"revision:{source_search_id}:{retailer_id}:{new_id}".encode()
+        ).hexdigest()
+        with SessionLocal.begin() as db:
+            db.add(SearchRow(
+                id=new_id, cache_key=revision_key,
+                request_json=source.request.model_dump_json(),
+                resolved_query=source.resolved_query,
+                source_search_id=source_search_id,
+                rechecked_retailer_id=retailer_id,
+                verification_attempt=result.verification_attempt,
+                state="running", cached=False, created_at=now,
+            ))
+            for row in offer_rows:
+                db.add(OfferRow(
+                    search_id=new_id, retailer_id=row.retailer_id,
+                    offer_json=row.offer_json, weak=row.weak, checked_at=row.checked_at,
+                ))
+            for row in run_rows:
+                db.add(AdapterRunRow(
+                    search_id=new_id, retailer_id=row.retailer_id, state=row.state,
+                    offer_count=row.offer_count, error=row.error, elapsed_ms=row.elapsed_ms,
+                    reason_code=row.reason_code, http_status=row.http_status,
+                    retry_count=row.retry_count, circuit_state=row.circuit_state,
+                    source_url=row.source_url, outcome=row.outcome,
+                    diagnostics_json=row.diagnostics_json, created_at=row.created_at,
+                ))
+        await self._emit(new_id, "search_started", {
+            "search_id": new_id, "revision_of": source_search_id,
+            "rechecked_retailer_id": retailer_id,
+        })
+        task = asyncio.create_task(self._run_recheck(new_id, adapter, execution_request))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return result
+
+    async def _run_recheck(
+        self, search_id: str, adapter: RetailerAdapter, request: SearchRequest,
+    ) -> None:
+        await self._run_adapter(search_id, adapter, request, True)
+        result = self._results[search_id]
+        selected = next(
+            item for item in result.retailers
+            if item.retailer_id == adapter.definition.id
+        )
+        if selected.outcome == "verification_required":
+            # A retained clearance that immediately hits the challenge again
+            # is not useful evidence. Remove it so the one manual retry starts
+            # with a clean browser context rather than replaying stale state.
+            from .adapters.browser import assisted_sessions
+            await assisted_sessions.reset(adapter.definition.id)
+            selected.session_state = "none"
+        result.offers = rank_offers(deduplicate_offers(result.offers))
+        result.state = "complete"
+        result.completed_at = utcnow()
+        with SessionLocal.begin() as db:
+            row = db.get(SearchRow, search_id)
+            if row:
+                row.state = "complete"
+                row.completed_at = result.completed_at
+        await self._emit(search_id, "search_complete", result.model_dump(mode="json"))
+
     def _model_vocabulary(self) -> ModelVocabulary:
         if self.vocabulary is not None:
             return self.vocabulary
@@ -143,6 +253,7 @@ class SearchManager:
                 SearchRow.cache_key == self.cache_key(request),
                 SearchRow.state == "complete",
                 SearchRow.cached.is_(False),
+                SearchRow.source_search_id.is_(None),
                 SearchRow.completed_at >= cutoff,
             ).order_by(desc(SearchRow.completed_at)).limit(1))
 
@@ -438,7 +549,11 @@ class SearchManager:
                 valid_offers.append(offer)
         result = SearchResult(
             id=UUID(search.id), request=original_request,
-            resolved_query=search.resolved_query, state=search.state,
+            resolved_query=search.resolved_query,
+            revision_of=UUID(search.source_search_id) if search.source_search_id else None,
+            rechecked_retailer_id=search.rechecked_retailer_id,
+            verification_attempt=search.verification_attempt,
+            state=search.state,
             offers=rank_offers(valid_offers),
             retailers=[self._status_from_run(run) for run in runs],
             created_at=search.created_at, completed_at=search.completed_at, cached=search.cached,

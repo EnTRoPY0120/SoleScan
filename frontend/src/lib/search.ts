@@ -78,7 +78,7 @@ export async function loadSearch(searchId: string): Promise<SearchResult> {
   return apiJson(response, 'Could not load search results.');
 }
 
-export async function startRetailerSession(retailerId: string, searchId: string): Promise<{ viewer_url: string }> {
+export async function startRetailerSession(retailerId: string, searchId: string): Promise<{ viewer_url: string; expires_at: number; session_state: 'active' }> {
   const response = await fetch(`/api/retailers/${encodeURIComponent(retailerId)}/session/start`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ search_id: searchId })
@@ -94,9 +94,14 @@ export async function completeRetailerSession(retailerId: string, searchId: stri
   return apiJson(response, 'Could not complete the assisted retailer session.');
 }
 
-export async function cancelRetailerSession(retailerId: string): Promise<void> {
+export async function closeRetailerSession(retailerId: string): Promise<void> {
+  const response = await fetch(`/api/retailers/${encodeURIComponent(retailerId)}/session/active`, { method: 'DELETE' });
+  await apiJson(response, 'Could not close the verification window.');
+}
+
+export async function forgetRetailerSession(retailerId: string): Promise<void> {
   const response = await fetch(`/api/retailers/${encodeURIComponent(retailerId)}/session`, { method: 'DELETE' });
-  await apiJson(response, 'Could not cancel the verification session.');
+  await apiJson(response, 'Could not forget the retained verification.');
 }
 
 type EventSourceLike = {
