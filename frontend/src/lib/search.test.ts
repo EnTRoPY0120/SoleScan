@@ -13,8 +13,9 @@ describe('search helpers', () => {
     expect(validateSearch({ ...valid, pinCode: '012345' })).toMatch('PIN code');
     expect(createSearchBody(valid)).toEqual({
       query: 'Speedcat OG', uk_size: '9', brand: 'Puma', colourway: null,
-      department: 'any', pin_code: null
+      department: 'any', pin_code: null, allow_query_correction: true
     });
+    expect(createSearchBody(valid, false).allow_query_correction).toBe(false);
   });
 
   it('routes SSE updates, completion, and closure', () => {
@@ -45,6 +46,7 @@ describe('search helpers', () => {
     expect(brandConflict({ ...conflict, brand: 'Onitsuka Tiger' })).toBe('');
     const request = createSearchBody(valid);
     expect(inputMatchesRequest(valid, request)).toBe(true);
+    expect(inputMatchesRequest(valid, { ...request, allow_query_correction: false })).toBe(true);
     expect(inputMatchesRequest({ ...valid, ukSize: '10' }, request)).toBe(false);
   });
 });

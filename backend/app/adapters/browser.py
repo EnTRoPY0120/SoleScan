@@ -10,7 +10,8 @@ from urllib.parse import quote_plus, urljoin
 from bs4 import BeautifulSoup
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
-from .base import AdapterError, PartialResultError, RetailerAdapter, RetailerBlockedError, RetailerDefinition, detect_challenge
+from .base import AdapterError, PartialResultError, RetailerAdapter, RetailerBlockedError, RetailerDefinition, detect_challenge, shared_client
+from ..assisted_runtime import AssistedBrowserRuntime, assisted_runtime
 from ..normalization import canonical_query, classify_category, effective_price, extract_department, normalize_size, parse_inr_paise, recognized_brands
 from ..schemas import ConditionalOffer, Offer, SearchRequest
 
@@ -22,6 +23,7 @@ PRODUCT_LINK_SELECTORS = {
     "nykaa_fashion": 'a[href*="/p/"],a[href*="/product/"]',
     "reebok": 'a[href*="/p/"]',
 }
+HTTP_FALLBACK_RETAILERS = {"foot_locker", "myntra", "nykaa_fashion"}
 
 
 class BrowserPool:
@@ -99,7 +101,14 @@ class BrowserPool:
             if not self._assisted_playwright or not connected:
                 self._assisted_playwright = await async_playwright().start()
                 try:
-                    self._assisted_browser = await self._assisted_playwright.chromium.launch(headless=False)
+                    # Pass DISPLAY explicitly. Playwright's headed launch can
+                    # otherwise lose the inherited display in long-lived ASGI
+                    # process environments even though the X socket is ready.
+                    launch_env = dict(os.environ)
+                    launch_env["DISPLAY"] = os.getenv("DISPLAY", ":99")
+                    self._assisted_browser = await self._assisted_playwright.chromium.launch(
+                        headless=False, env=launch_env,
+                    )
                 except Exception:
                     await self._assisted_playwright.stop()
                     self._assisted_playwright = self._assisted_browser = None
@@ -130,14 +139,19 @@ class ChallengeNotClearedError(RuntimeError):
 class AssistedBrowserSessions:
     """Single-user, single-retailer assisted browser session coordinator."""
 
-    def __init__(self, pool: BrowserPool | None = None, directory=None) -> None:
+    def __init__(self, pool: BrowserPool | None = None, directory=None, runtime: AssistedBrowserRuntime | None = None) -> None:
         from ..config import settings
         self.pool = pool or browser_pool
         self.directory = Path(directory or settings.browser_sessions_dir)
+        self.runtime = runtime or assisted_runtime
+        self.idle_seconds = settings.assisted_session_idle_seconds
         self._lock = asyncio.Lock()
         self._active: dict | None = None
+        self._expiry_task: asyncio.Task | None = None
 
     def state_for(self, retailer_id: str) -> str:
+        if self._active and self._active["retailer_id"] == retailer_id:
+            return "active"
         path = self.directory / f"{retailer_id}.json"
         if not path.exists():
             return "none"
@@ -161,6 +175,7 @@ class AssistedBrowserSessions:
         async with self._lock:
             if self._active is not None:
                 raise SessionBusyError("Another retailer session is already active")
+            await self.runtime.ensure_ready()
             self.directory.mkdir(parents=True, exist_ok=True)
             try:
                 os.chmod(self.directory, 0o700)
@@ -186,6 +201,7 @@ class AssistedBrowserSessions:
                 raise
             self._active = {"retailer_id": retailer_id, "search_id": search_id,
                             "context": context, "page": page, "path": path}
+            self._expiry_task = asyncio.create_task(self._expire_after(retailer_id, search_id))
             from ..config import settings
             return {"retailer_id": retailer_id, "search_id": search_id,
                     "session_state": "active", "viewer_url": settings.vnc_url}
@@ -215,6 +231,7 @@ class AssistedBrowserSessions:
             os.chmod(path, 0o600)
             await self.pool.release(active["context"])
             self._active = None
+            self._cancel_expiry()
             return {"retailer_id": retailer_id, "session_state": "active", "storage_path": str(path)}
 
     async def reset(self, retailer_id: str) -> None:
@@ -222,11 +239,29 @@ class AssistedBrowserSessions:
             if self._active and self._active["retailer_id"] == retailer_id:
                 await self.pool.release(self._active["context"])
                 self._active = None
+                self._cancel_expiry()
             path = self.directory / f"{retailer_id}.json"
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
+
+    async def _expire_after(self, retailer_id: str, search_id: str) -> None:
+        try:
+            await asyncio.sleep(self.idle_seconds)
+            async with self._lock:
+                active = self._active
+                if active and active["retailer_id"] == retailer_id and active["search_id"] == search_id:
+                    await self.pool.release(active["context"])
+                    self._active = None
+                    self._expiry_task = None
+        except asyncio.CancelledError:
+            return
+
+    def _cancel_expiry(self) -> None:
+        task, self._expiry_task = self._expiry_task, None
+        if task and task is not asyncio.current_task():
+            task.cancel()
 
 
 assisted_sessions = AssistedBrowserSessions()
@@ -240,6 +275,158 @@ class BrowserMarketplaceAdapter(RetailerAdapter):
         self.pool = pool or browser_pool
 
     async def search(self, request: SearchRequest, *, bypass_cache: bool = False) -> list[Offer]:
+        for attempt in range(2):
+            try:
+                return await self._search_once(request)
+            except AdapterError as exc:
+                if (
+                    exc.reason_code == "transport_protocol" and attempt == 0
+                    and self.definition.id in HTTP_FALLBACK_RETAILERS
+                ):
+                    try:
+                        return await self._http_fallback(request)
+                    except AdapterError as fallback_exc:
+                        fallback_exc.retry_count = 1
+                        fallback_exc.diagnostics["attempt"] = 2
+                        fallback_exc.diagnostics.setdefault("transport", "httpx_http1")
+                        raise
+                if exc.reason_code != "transport_protocol" or attempt == 1:
+                    exc.retry_count = attempt
+                    if exc.diagnostics:
+                        exc.diagnostics["attempt"] = attempt + 1
+                    raise
+                # A protocol failure can be connection-specific. Release the
+                # failed context in _search_once, then retry exactly once with
+                # a new isolated browser context.
+        raise AssertionError("bounded browser retry exhausted")
+
+    async def _http_fallback(self, request: SearchRequest) -> list[Offer]:
+        """Explicit HTTP/1 fallback after Chromium's HTTP/2 transport fails."""
+        query = canonical_query(request, include_brand=self.definition.kind in {"boutique", "marketplace"})
+        search_url = self.definition.search_url.format(query=quote_plus(query))
+        response = await shared_client.get(search_url)
+        if self.definition.id == "myntra":
+            return self._parse_myntra_search(response.text, request, str(response.url))
+        raise AdapterError(
+            f"{self.definition.name} returned an unsupported fallback response",
+            reason_code="catalog_contract_changed",
+            http_status=response.status_code,
+            diagnostics={
+                "stage": "catalog", "final_url": str(response.url),
+                "http_status": response.status_code, "transport": "httpx_http1",
+            },
+        )
+
+    def _parse_myntra_search(self, payload: str, request: SearchRequest, source_url: str) -> list[Offer]:
+        soup = BeautifulSoup(payload, "html.parser")
+        script_text = next(
+            (node.string or node.get_text() for node in soup.find_all("script") if "window.__myx = " in (node.string or node.get_text())),
+            None,
+        )
+        try:
+            raw = script_text.split("window.__myx = ", 1)[1].rsplit(";", 1)[0]
+            results = json.loads(raw)["searchData"]["results"]
+            total = results["totalCount"]
+            products = results["products"]
+            if not isinstance(total, int) or not isinstance(products, list):
+                raise TypeError
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise AdapterError(
+                "Myntra returned an unrecognized search response",
+                reason_code="catalog_contract_changed",
+                diagnostics={"stage": "catalog", "final_url": source_url, "transport": "httpx_http1"},
+            )
+        if total == 0 and products == []:
+            return []
+        if total > 0 and not products:
+            raise AdapterError(
+                "Myntra returned an inconsistent search response",
+                reason_code="catalog_contract_changed",
+                diagnostics={"stage": "catalog", "final_url": source_url, "transport": "httpx_http1"},
+            )
+
+        offers: list[Offer] = []
+        failures = 0
+        requested = normalize_size(request.uk_size)
+        for product in products[:8]:
+            try:
+                name = str(product["productName"] or product["product"]).strip()
+                listed = parse_inr_paise(product["mrp"])
+                sale = parse_inr_paise(product.get("price") or product["mrp"])
+                if sale > listed:
+                    raise ValueError
+                sizes = {
+                    normalize_size(value.strip())
+                    for value in str(product.get("sizes") or "").split(",") if value.strip()
+                }
+                images = product.get("images") or []
+                image = next((item.get("src") for item in images if item.get("view") in {"default", "search"} and item.get("src")), None)
+                if image and image.startswith("http://"):
+                    image = "https://" + image.removeprefix("http://")
+                path = str(product["landingPageUrl"]).lstrip("/")
+                brand = str(product.get("brand") or request.brand or "") or None
+                offers.append(Offer(
+                    retailer=self.definition.name,
+                    product_name=name,
+                    brand=brand,
+                    model=self._myntra_model(name, brand, request),
+                    colourway=product.get("primaryColour"),
+                    category=classify_category(
+                        category=product.get("category"), product_type=(product.get("articleType") or {}).get("typeName"),
+                        title=name, url=path,
+                    ),
+                    department=extract_department(gender=product.get("gender"), title=name, url=path),
+                    image_url=image,
+                    style_code=str(product["productId"]),
+                    requested_uk_size=requested,
+                    size_available=requested in sizes,
+                    stock_status="in_stock" if requested in sizes else "out_of_stock",
+                    listed_price_paise=listed,
+                    automatic_discount_paise=listed - sale,
+                    shipping_paise=None,
+                    effective_price_paise=effective_price(listed, listed - sale),
+                    product_url=f"https://www.myntra.com/{path}",
+                    return_policy="Confirm the current Myntra return window and seller on the product page.",
+                    match_score=0,
+                    last_checked=datetime.now(timezone.utc),
+                ))
+            except (KeyError, TypeError, ValueError):
+                failures += 1
+        if failures and offers:
+            raise PartialResultError(
+                f"Myntra: {failures} of {len(products[:8])} products did not match the catalog contract",
+                offers=offers, reason_code="partial_results",
+                diagnostics={"stage": "product", "final_url": source_url, "transport": "httpx_http1"},
+            )
+        if not offers:
+            raise AdapterError(
+                "Myntra product extraction failed", reason_code="product_extraction_failed",
+                diagnostics={"stage": "product", "final_url": source_url, "transport": "httpx_http1"},
+            )
+        return offers
+
+    @staticmethod
+    def _myntra_model(name: str, brand: str | None, request: SearchRequest) -> str:
+        """Remove only structured merchandising suffixes from an exact query title."""
+        from ..normalization import normalize_text
+
+        title_tokens = normalize_text(name).split()
+        brand_tokens = normalize_text(brand).split()
+        if brand_tokens and title_tokens[:len(brand_tokens)] == brand_tokens:
+            title_tokens = title_tokens[len(brand_tokens):]
+        query_tokens = canonical_query(request, include_brand=False).split()
+        descriptors = {
+            "men", "mens", "women", "womens", "unisex", "kids", "boys", "girls",
+            "lace", "ups", "running", "sports", "sportstyle", "casual", "shoes",
+            "shoe", "sneakers", "sneaker",
+        }
+        if title_tokens[:len(query_tokens)] == query_tokens and all(
+            token in descriptors for token in title_tokens[len(query_tokens):]
+        ):
+            return " ".join(query_tokens)
+        return name
+
+    async def _search_once(self, request: SearchRequest) -> list[Offer]:
         query = canonical_query(request, include_brand=self.definition.kind in {"boutique", "marketplace"})
         search_url = self.definition.search_url.format(query=quote_plus(query))
 
@@ -353,22 +540,35 @@ class BrowserMarketplaceAdapter(RetailerAdapter):
                 ) from exc
             # HTTP/2 protocol errors
             if "net::ERR_HTTP2_PROTOCOL_ERROR" in message or "HTTP2" in message:
+                net_error = "ERR_HTTP2_PROTOCOL_ERROR" if "ERR_HTTP2_PROTOCOL_ERROR" in message else "HTTP2"
                 raise AdapterError(
-                    f"{self.definition.name} failed due to an HTTP/2 transport error; the site may require a different protocol",
+                    f"{self.definition.name} could not establish a browser connection",
                     reason_code="transport_protocol",
+                    diagnostics={
+                        "error_type": type(exc).__name__, "final_url": search_url,
+                        "net_error": net_error, "stage": "navigation", "transport": "chromium",
+                    },
                 ) from exc
             # Generic net errors
             if "net::ERR_" in message:
                 err_code = message.split("net::ERR_")[1].split()[0] if "net::ERR_" in message else "UNKNOWN"
                 raise AdapterError(
-                    f"{self.definition.name} could not load the page (net::ERR_{err_code})",
+                    f"{self.definition.name} could not establish a browser connection",
                     reason_code="browser_network_error",
+                    diagnostics={
+                        "error_type": type(exc).__name__, "final_url": search_url,
+                        "net_error": f"ERR_{err_code}", "stage": "navigation", "transport": "chromium",
+                    },
                 ) from exc
             # Generic browser error with type
             short_msg = message[:100] if len(message) > 100 else message
             raise AdapterError(
                 f"{self.definition.name} browser collection failed ({type(exc).__name__}): {short_msg}",
                 reason_code="browser_collection_failed",
+                diagnostics={
+                    "error_type": type(exc).__name__, "final_url": search_url,
+                    "stage": "browser_collection", "transport": "chromium",
+                },
             ) from exc
         finally:
             if context is not None:

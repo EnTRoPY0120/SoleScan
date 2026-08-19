@@ -3,9 +3,9 @@ import json
 
 from sqlalchemy import select
 
-from app.adapters.base import RetailerAdapter, RetailerBlockedError, RetailerDefinition
+from app.adapters.base import AdapterError, RetailerAdapter, RetailerBlockedError, RetailerDefinition
 from app.adapters.onitsuka import OnitsukaAdapter
-from app.db import SearchRow, SessionLocal, init_db
+from app.db import AdapterRunRow, SearchRow, SessionLocal, init_db
 from app.schemas import Offer, SearchRequest
 from app.search import SearchManager
 
@@ -83,15 +83,16 @@ async def complete(manager: SearchManager, search_id: str):
     raise AssertionError("search did not complete")
 
 
-async def test_manual_adapter_performs_no_call_and_has_safe_link():
+async def test_adapter_runs_automatically_and_has_safe_link():
     init_db()
-    adapter = CountingAdapter(manual=True)
+    adapter = CountingAdapter()
     manager = SearchManager([adapter])
     created = await manager.create(SearchRequest(query="Mexico 66", uk_size="8"), bypass_cache=True)
     result = await complete(manager, str(created.id))
-    assert adapter.calls == 0
-    assert result.retailers[0].state == "manual"
-    assert result.retailers[0].source == "https://example.com/search?q=Mexico+66"
+    assert adapter.calls == 1
+    assert result.retailers[0].state == "complete"
+    assert result.retailers[0].outcome == "valid_empty"
+    assert result.retailers[0].source == "https://example.com/search?q=mexico+66"
 
 
 async def test_cached_failure_keeps_diagnostics_and_clone_never_becomes_source():
@@ -104,6 +105,7 @@ async def test_cached_failure_keeps_diagnostics_and_clone_never_becomes_source()
     cached = await manager.create(request.model_copy())
     status = cached.retailers[0]
     assert status.state == "blocked"
+    assert status.outcome == "access_blocked"
     assert status.reason_code == "http_403" and status.http_status == 403
     assert status.source.startswith("https://")
     with SessionLocal() as db:
@@ -123,3 +125,35 @@ def test_legacy_offer_infers_stock_status():
         "match_score": 0,
     }
     assert Offer.model_validate(raw).stock_status == "out_of_stock"
+
+
+class DiagnosticAdapter(CountingAdapter):
+    async def search(self, request, *, bypass_cache=False):
+        self.calls += 1
+        raise AdapterError(
+            "browser failed", reason_code="transport_protocol", retry_count=1,
+            diagnostics={
+                "stage": "navigation", "net_error": "ERR_HTTP2_PROTOCOL_ERROR",
+                "secret": "must-not-be-retained",
+            },
+        )
+
+
+async def test_precise_outcomes_and_sanitized_diagnostics_are_persisted():
+    init_db()
+    empty = CountingAdapter()
+    empty_manager = SearchManager([empty])
+    created = await empty_manager.create(SearchRequest(query="Empty Contract", uk_size="8"), bypass_cache=True)
+    result = await complete(empty_manager, str(created.id))
+    assert result.retailers[0].outcome == "valid_empty"
+
+    failing = DiagnosticAdapter()
+    manager = SearchManager([failing])
+    created = await manager.create(SearchRequest(query="Transport Contract", uk_size="8"), bypass_cache=True)
+    result = await complete(manager, str(created.id))
+    assert result.retailers[0].outcome == "transport_failure"
+    with SessionLocal() as db:
+        run = db.scalar(select(AdapterRunRow).where(AdapterRunRow.search_id == str(created.id)))
+    assert run is not None and run.outcome == "transport_failure"
+    assert '"net_error": "ERR_HTTP2_PROTOCOL_ERROR"' in run.diagnostics_json
+    assert "secret" not in run.diagnostics_json

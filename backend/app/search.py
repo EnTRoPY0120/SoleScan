@@ -15,11 +15,12 @@ from .adapters.base import AdapterError, PartialResultError, RetailerAdapter, Re
 from .config import settings
 from .db import AdapterRunRow, OfferRow, SearchRow, SessionLocal, utcnow
 from .normalization import accept_offer, classify_category, colour_matches, deduplicate_offers, extract_department, normalize_size, normalize_text, rank_offers
+from .query_resolution import ModelEvidence, ModelVocabulary
 from .schemas import Offer, ProductCategory, ProductDepartment, RetailerStatus, SearchRequest, SearchResult
 
 
 log = structlog.get_logger()
-CACHE_VERSION = 6  # Exact model/category/department contract; do not replay v5 jobs.
+CACHE_VERSION = 7  # Evidence-bearing retailer outcomes; do not replay v6 jobs.
 
 
 class SearchNotFound(KeyError):
@@ -27,9 +28,15 @@ class SearchNotFound(KeyError):
 
 
 class SearchManager:
-    def __init__(self, adapters: list[RetailerAdapter] | None = None) -> None:
+    def __init__(
+        self,
+        adapters: list[RetailerAdapter] | None = None,
+        *,
+        vocabulary: ModelVocabulary | None = None,
+    ) -> None:
         self.adapters = list(ADAPTERS if adapters is None else adapters)
         self.definitions = list(DEFINITIONS if adapters is None else [adapter.definition for adapter in self.adapters])
+        self.vocabulary = vocabulary
         self._results: dict[str, SearchResult] = {}
         self._events: dict[str, list[dict]] = defaultdict(list)
         self._conditions: dict[str, asyncio.Condition] = defaultdict(asyncio.Condition)
@@ -48,6 +55,7 @@ class SearchManager:
     @staticmethod
     def cache_key(request: SearchRequest) -> str:
         data = request.model_dump(mode="json")
+        data.pop("allow_query_correction", None)
         data["query"] = normalize_text(data["query"])
         data["brand"] = normalize_text(data.get("brand")) or None
         data["colourway"] = normalize_text(data.get("colourway")) or None
@@ -57,11 +65,15 @@ class SearchManager:
         return hashlib.sha256(packed.encode()).hexdigest()
 
     async def create(self, request: SearchRequest, *, bypass_cache: bool = False) -> SearchResult:
+        self._prune_diagnostics()
         request.uk_size = normalize_size(request.uk_size)
+        resolution = self._model_vocabulary().resolve(request) if request.allow_query_correction else None
+        resolved_query = resolution.resolved_query if resolution and resolution.corrected else None
+        execution_request = request.model_copy(update={"query": resolved_query or request.query})
         if not bypass_cache:
-            cached = self._find_cached(request)
+            cached = self._find_cached(execution_request)
             if cached:
-                return await self._clone_cached(cached, request)
+                return await self._clone_cached(cached, request, execution_request, resolved_query)
         search_id = str(uuid4())
         now = utcnow()
         statuses = [
@@ -69,27 +81,52 @@ class SearchManager:
                 retailer_id=definition.id,
                 retailer=definition.name,
                 state="pending",
-                source=self._source_url(definition, request),
+                source=self._source_url(definition, execution_request),
                 session_capable=definition.session_capable,
                 session_state=self._session_state(definition.id),
             )
             for definition in self.definitions
         ]
         result = SearchResult(
-            id=UUID(search_id), request=request, state="running", offers=[],
+            id=UUID(search_id), request=request,
+            resolved_query=resolved_query,
+            state="running", offers=[],
             retailers=statuses, created_at=now,
         )
         self._results[search_id] = result
         with SessionLocal.begin() as db:
             db.add(SearchRow(
-                id=search_id, cache_key=self.cache_key(request),
-                request_json=request.model_dump_json(), state="running", cached=False, created_at=now,
+                id=search_id, cache_key=self.cache_key(execution_request),
+                request_json=request.model_dump_json(), resolved_query=resolved_query,
+                state="running", cached=False, created_at=now,
             ))
         await self._emit(search_id, "search_started", {"search_id": search_id})
-        task = asyncio.create_task(self._run(search_id, bypass_cache=bypass_cache))
+        task = asyncio.create_task(self._run(search_id, execution_request, bypass_cache=bypass_cache))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return result
+
+    def _model_vocabulary(self) -> ModelVocabulary:
+        if self.vocabulary is not None:
+            return self.vocabulary
+        kinds = {definition.id: definition.kind for definition in self.definitions}
+        with SessionLocal() as db:
+            rows = db.scalars(select(OfferRow)).all()
+        evidence: list[ModelEvidence] = []
+        for row in rows:
+            kind = kinds.get(row.retailer_id)
+            if kind is None or row.weak:
+                continue
+            try:
+                offer = Offer.model_validate_json(row.offer_json)
+            except ValueError:
+                continue
+            model = offer.model or offer.product_name
+            if model:
+                evidence.append(ModelEvidence(
+                    row.retailer_id, kind, offer.brand, model,
+                ))
+        return ModelVocabulary.default(evidence)
 
     @staticmethod
     def _session_state(retailer_id: str) -> str:
@@ -109,7 +146,13 @@ class SearchManager:
                 SearchRow.completed_at >= cutoff,
             ).order_by(desc(SearchRow.completed_at)).limit(1))
 
-    async def _clone_cached(self, source: SearchRow, request: SearchRequest) -> SearchResult:
+    async def _clone_cached(
+        self,
+        source: SearchRow,
+        request: SearchRequest,
+        execution_request: SearchRequest,
+        resolved_query: str | None,
+    ) -> SearchResult:
         new_id = str(uuid4())
         now = utcnow()
         with SessionLocal() as db:
@@ -118,15 +161,17 @@ class SearchManager:
         strong = [Offer.model_validate_json(row.offer_json) for row in offers if not row.weak]
         statuses = [self._status_from_run(row, cached=True) for row in runs]
         result = SearchResult(
-            id=UUID(new_id), request=request, state="complete", offers=rank_offers(strong),
+            id=UUID(new_id), request=request, resolved_query=resolved_query,
+            state="complete", offers=rank_offers(strong),
             retailers=statuses, created_at=now,
             completed_at=now, cached=True,
         )
         self._results[new_id] = result
         with SessionLocal.begin() as db:
             db.add(SearchRow(
-                id=new_id, cache_key=self.cache_key(request), request_json=request.model_dump_json(),
-                state="complete", cached=True, created_at=now, completed_at=now,
+                id=new_id, cache_key=self.cache_key(execution_request), request_json=request.model_dump_json(),
+                resolved_query=resolved_query, state="complete", cached=True,
+                created_at=now, completed_at=now,
             ))
             for row in offers:
                 db.add(OfferRow(search_id=new_id, retailer_id=row.retailer_id, offer_json=row.offer_json, weak=row.weak, checked_at=now))
@@ -137,15 +182,16 @@ class SearchManager:
                     offer_count=row.offer_count, error=row.error, elapsed_ms=row.elapsed_ms,
                     reason_code=row.reason_code, http_status=row.http_status,
                     retry_count=row.retry_count, circuit_state=row.circuit_state,
-                    source_url=row.source_url, created_at=now,
+                    source_url=row.source_url, outcome=row.outcome,
+                    diagnostics_json=row.diagnostics_json, created_at=now,
                 ))
         await self._emit(new_id, "cache_hit", {"source_search_id": source.id})
         await self._emit(new_id, "search_complete", result.model_dump(mode="json"))
         return result
 
-    async def _run(self, search_id: str, *, bypass_cache: bool) -> None:
+    async def _run(self, search_id: str, request: SearchRequest, *, bypass_cache: bool) -> None:
         tasks = [
-            asyncio.create_task(self._run_adapter(search_id, adapter, bypass_cache))
+            asyncio.create_task(self._run_adapter(search_id, adapter, request, bypass_cache))
             for adapter in self.adapters
         ]
         try:
@@ -162,6 +208,7 @@ class SearchManager:
                     status.state = "timeout"
                     status.error = f"Overall {settings.overall_timeout_seconds:g}-second search deadline reached"
                     status.reason_code = "overall_timeout"
+                    status.outcome = "transport_failure"
                     await self._emit(search_id, "retailer_error", status.model_dump(mode="json"))
                     definition = next((d for d in self.definitions if d.name == status.retailer), None)
                     if definition:
@@ -175,6 +222,7 @@ class SearchManager:
                                     search_id=search_id, retailer_id=definition.id,
                                     state="timeout", error=status.error,
                                     reason_code=status.reason_code, source_url=status.source,
+                                    outcome=status.outcome,
                                     elapsed_ms=round(settings.overall_timeout_seconds * 1000), created_at=utcnow(),
                                 ))
         result = self._results[search_id]
@@ -188,7 +236,13 @@ class SearchManager:
                 row.completed_at = result.completed_at
         await self._emit(search_id, "search_complete", result.model_dump(mode="json"))
 
-    async def _run_adapter(self, search_id: str, adapter: RetailerAdapter, bypass_cache: bool) -> None:
+    async def _run_adapter(
+        self,
+        search_id: str,
+        adapter: RetailerAdapter,
+        request: SearchRequest,
+        bypass_cache: bool,
+    ) -> None:
         result = self._results[search_id]
         status = next(item for item in result.retailers if item.retailer == adapter.definition.name)
         status.state = "running"
@@ -196,34 +250,38 @@ class SearchManager:
         await self._emit(search_id, "retailer_started", status.model_dump(mode="json"))
         state = "complete"
         error = None
+        diagnostics: dict = {}
         accepted: list[Offer] = []
         definition = adapter.definition
         try:
             async with asyncio.timeout(settings.retailer_timeout_seconds):
-                offers = await adapter.search(result.request, bypass_cache=bypass_cache)
+                offers = await adapter.search(request, bypass_cache=bypass_cache)
                 for offer in offers:
                     self._prepare_offer(offer)
-                    offer.colour_match = colour_matches(result.request, offer)
-                    if accept_offer(result.request, offer, footwear_scope_verified=definition.footwear_only_scope):
+                    offer.colour_match = colour_matches(request, offer)
+                    if accept_offer(request, offer, footwear_scope_verified=definition.footwear_only_scope):
                         offer.match_score = 1
                         offer.confidence = "exact"
                         accepted.append(offer)
                 result.offers.extend(accepted)
                 status.state = "complete"
                 status.offer_count = len(accepted)
+                status.outcome = "offers_found" if accepted else "valid_empty"
                 self.health[adapter.definition.id] = ("healthy", None)
         except PartialResultError as exc:
+            diagnostics = exc.diagnostics
             # Some products succeeded - use partial offers
             for offer in exc.offers:
                 self._prepare_offer(offer)
-                offer.colour_match = colour_matches(result.request, offer)
-                if accept_offer(result.request, offer, footwear_scope_verified=definition.footwear_only_scope):
+                offer.colour_match = colour_matches(request, offer)
+                if accept_offer(request, offer, footwear_scope_verified=definition.footwear_only_scope):
                     offer.match_score = 1
                     offer.confidence = "exact"
                     accepted.append(offer)
             result.offers.extend(accepted)
             state = status.state = "partial"
             status.offer_count = len(accepted)
+            status.outcome = "offers_found"
             status.error = str(exc)[:300]
             self._apply_diagnostics(status, exc)
             self.health[adapter.definition.id] = ("healthy", str(exc))
@@ -232,13 +290,19 @@ class SearchManager:
             state = status.state = "timeout"
             error = status.error = f"Retailer did not respond within {settings.retailer_timeout_seconds:g} seconds"
             status.reason_code = "retailer_timeout"
+            status.outcome = "transport_failure"
             self.health[adapter.definition.id] = ("unavailable", error)
         except RetailerBlockedError as exc:
+            diagnostics = exc.diagnostics
             state = status.state = "needs_session" if (
                 definition.session_capable and exc.reason_code == "verification_challenge"
             ) else "blocked"
             error = status.error = str(exc)[:300] or "Retailer was not checked"
             self._apply_diagnostics(status, exc)
+            status.outcome = (
+                "verification_required" if exc.reason_code == "verification_challenge"
+                else "access_blocked"
+            )
             self.health[adapter.definition.id] = ("unavailable", error)
             log.warning(
                 "adapter_blocked", retailer=adapter.definition.id,
@@ -246,9 +310,11 @@ class SearchManager:
                 retry_count=exc.retry_count, circuit_state=exc.circuit_state,
             )
         except AdapterError as exc:
+            diagnostics = exc.diagnostics
             state = status.state = "timeout" if exc.reason_code == "retailer_timeout" else "error"
             error = status.error = str(exc)[:300] or "Retailer was unavailable"
             self._apply_diagnostics(status, exc)
+            status.outcome = self._outcome_for_error(exc)
             self.health[adapter.definition.id] = ("unavailable", error)
             log.warning(
                 "adapter_failed", retailer=adapter.definition.id,
@@ -256,8 +322,11 @@ class SearchManager:
                 retry_count=exc.retry_count, circuit_state=exc.circuit_state,
             )
         except Exception as exc:
+            diagnostics = {"error_type": type(exc).__name__, "stage": "adapter"}
             state = status.state = "error"
             error = status.error = str(exc)[:300] or type(exc).__name__
+            status.reason_code = "internal_failure"
+            status.outcome = "internal_failure"
             self.health[adapter.definition.id] = ("unavailable", error)
             log.warning("adapter_failed", retailer=adapter.definition.id, error=type(exc).__name__)
         status.elapsed_ms = round((time.monotonic() - started) * 1000)
@@ -267,7 +336,9 @@ class SearchManager:
                 offer_count=len(accepted), error=status.error or error, elapsed_ms=status.elapsed_ms,
                 reason_code=status.reason_code, http_status=status.http_status,
                 retry_count=status.retry_count, circuit_state=status.circuit_state,
-                source_url=status.source, created_at=utcnow(),
+                source_url=status.source, outcome=status.outcome,
+                diagnostics_json=json.dumps(diagnostics, sort_keys=True) if diagnostics else None,
+                created_at=utcnow(),
             ))
             for offer in accepted:
                 db.add(OfferRow(search_id=search_id, retailer_id=adapter.definition.id, offer_json=offer.model_dump_json(), weak=False, checked_at=utcnow()))
@@ -294,6 +365,38 @@ class SearchManager:
         SearchManager._apply_retry_at(status)
 
     @staticmethod
+    def _outcome_for_error(exc: AdapterError) -> str:
+        if exc.reason_code in {
+            "catalog_shell", "catalog_contract_changed", "product_extraction_failed",
+            "malformed_product", "unreadable_catalog", "http_404",
+        }:
+            return "contract_changed"
+        if exc.reason_code in {"rate_limited", "http_401", "http_403", "host_cooldown"}:
+            return "access_blocked"
+        if exc.reason_code in {
+            "retailer_timeout", "network_failure", "transport_protocol",
+            "browser_network_error", "http_408", "http_500", "http_502",
+            "http_503", "http_504",
+        }:
+            return "transport_failure"
+        return "internal_failure"
+
+    @staticmethod
+    def _prune_diagnostics() -> None:
+        cutoff = utcnow() - timedelta(seconds=settings.diagnostic_retention_seconds)
+        try:
+            with SessionLocal.begin() as db:
+                rows = db.scalars(select(AdapterRunRow).where(
+                    AdapterRunRow.diagnostics_json.is_not(None),
+                    AdapterRunRow.created_at < cutoff,
+                )).all()
+                for row in rows:
+                    row.diagnostics_json = None
+        except Exception:
+            # Diagnostics retention must never prevent a comparison from starting.
+            pass
+
+    @staticmethod
     def _apply_retry_at(status: RetailerStatus) -> None:
         if status.circuit_state != "open" or not status.source:
             return
@@ -318,6 +421,10 @@ class SearchManager:
             offers = db.scalars(select(OfferRow).where(OfferRow.search_id == search_id)).all()
             runs = db.scalars(select(AdapterRunRow).where(AdapterRunRow.search_id == search_id)).all()
         valid_offers: list[Offer] = []
+        original_request = SearchRequest.model_validate_json(search.request_json)
+        execution_request = original_request.model_copy(
+            update={"query": search.resolved_query or original_request.query}
+        )
         for row in offers:
             if row.weak:
                 continue
@@ -325,12 +432,13 @@ class SearchManager:
             definition = next((item for item in DEFINITIONS if item.id == row.retailer_id), None)
             self._prepare_offer(offer)
             if definition is not None and accept_offer(
-                SearchRequest.model_validate_json(search.request_json), offer,
+                execution_request, offer,
                 footwear_scope_verified=definition.footwear_only_scope,
             ):
                 valid_offers.append(offer)
         result = SearchResult(
-            id=UUID(search.id), request=SearchRequest.model_validate_json(search.request_json), state=search.state,
+            id=UUID(search.id), request=original_request,
+            resolved_query=search.resolved_query, state=search.state,
             offers=rank_offers(valid_offers),
             retailers=[self._status_from_run(run) for run in runs],
             created_at=search.created_at, completed_at=search.completed_at, cached=search.cached,
@@ -353,6 +461,7 @@ class SearchManager:
             retry_count=run.retry_count,
             circuit_state=run.circuit_state,
             source=run.source_url,
+            outcome=run.outcome,
             session_capable=next((d.session_capable for d in DEFINITIONS if d.id == run.retailer_id), False),
             session_state=SearchManager._session_state(run.retailer_id),
         )

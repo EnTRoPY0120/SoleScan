@@ -11,6 +11,8 @@ import structlog
 from .adapters import DEFINITIONS
 from .adapters.base import build_search_url
 from .adapters.browser import ChallengeNotClearedError, SessionBusyError, assisted_sessions, browser_pool
+from .assisted_runtime import AssistedBrowserUnavailableError, assisted_runtime
+from .canary import CanaryMonitor
 from .config import settings
 from .db import init_db
 from .schemas import RetailerInfo, RetailerSessionComplete, RetailerSessionStart, SearchRequest, SearchResult
@@ -18,14 +20,17 @@ from .search import SearchNotFound, manager
 
 
 structlog.configure(processors=[structlog.processors.TimeStamper(fmt="iso"), structlog.processors.JSONRenderer()])
+canary_monitor = CanaryMonitor(manager)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    canary_monitor.start()
     try:
         yield
     finally:
+        await canary_monitor.stop()
         await browser_pool.stop()
 
 
@@ -43,7 +48,11 @@ async def database_unavailable(_request: Request, _exc: OperationalError) -> JSO
 
 @app.get("/api/health")
 async def health() -> dict:
-    return {"status": "ready", "version": app.version}
+    assisted = await assisted_runtime.status()
+    return {
+        "status": "ready", "version": app.version,
+        "assisted_browser": "ready" if all(assisted.values()) else "unavailable",
+    }
 
 
 @app.get("/api/retailers", response_model=list[RetailerInfo])
@@ -118,17 +127,29 @@ async def start_retailer_session(retailer_id: str, body: RetailerSessionStart) -
         result = manager.get(str(body.search_id))
     except SearchNotFound as exc:
         raise HTTPException(status_code=404, detail="Search not found") from exc
+    session_request = result.request.model_copy(
+        update={"query": result.resolved_query or result.request.query}
+    )
     try:
         session = await assisted_sessions.start(
             retailer_id, str(body.search_id), build_search_url(
                 definition.search_url,
-                result.request,
+                    session_request,
                 include_brand=definition.kind in {"boutique", "marketplace"},
             )
         )
     except SessionBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except AssistedBrowserUnavailableError as exc:
+        structlog.get_logger().warning("assisted_browser_unavailable", missing=str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail="The verification browser is not ready. Restart the app and try again.",
+        ) from exc
     except Exception as exc:
+        structlog.get_logger().warning(
+            "assisted_session_failed", error=type(exc).__name__, detail=str(exc)[:2000],
+        )
         raise HTTPException(status_code=503, detail="Assisted browser is unavailable") from exc
     return session
 

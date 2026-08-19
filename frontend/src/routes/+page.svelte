@@ -2,7 +2,7 @@
   import '@fontsource-variable/manrope';
   import ResultsSection from '$lib/components/ResultsSection.svelte';
   import SearchForm from '$lib/components/SearchForm.svelte';
-  import { beginSearch, completeRetailerSession, connectSearchEvents, inputMatchesRequest, loadSearch, startRetailerSession, validateSearch, type SearchInput } from '$lib/search';
+  import { beginSearch, cancelRetailerSession, completeRetailerSession, connectSearchEvents, inputMatchesRequest, loadSearch, startRetailerSession, validateSearch, type SearchInput } from '$lib/search';
   import type { Offer, RetailerStatus, SearchResult } from '$lib/types';
 
   let query = '';
@@ -19,6 +19,7 @@
   let cached = false;
   let events: ReturnType<typeof connectSearchEvents> | null = null;
   let displayedRequest: SearchResult['request'] | null = null;
+  let resolvedQuery: string | null = null;
   $: inputsChanged = Boolean(displayedRequest && !inputMatchesRequest(input(), displayedRequest));
 
   function input(): SearchInput {
@@ -30,6 +31,7 @@
     retailers = result.retailers;
     cached = result.cached;
     displayedRequest = result.request;
+    resolvedQuery = result.resolved_query;
     if (result.state === 'complete') searching = false;
   }
 
@@ -62,14 +64,15 @@
     return cause instanceof Error ? cause.message : 'Search failed.';
   }
 
-  async function runSearch() {
+  async function runSearch(allowQueryCorrection = true) {
     searching = true;
     cached = false;
     offers = [];
     retailers = [];
+    resolvedQuery = null;
     events?.close();
     try {
-      const started = await beginSearch(input());
+      const started = await beginSearch(input(), '', allowQueryCorrection);
       searchId = started.id;
       cached = started.cached;
       await reload();
@@ -78,6 +81,12 @@
       error = errorMessage(cause);
       searching = false;
     }
+  }
+
+  async function searchOriginal() {
+    if (!displayedRequest || searching) return;
+    query = displayedRequest.query;
+    await runSearch(false);
   }
 
   async function refreshDisplayed() {
@@ -107,7 +116,7 @@
       else window.open(session.viewer_url, 'sole-scan-assisted-retailer', 'popup,width=1280,height=900');
     } catch (cause) {
       viewer?.close();
-      error = errorMessage(cause);
+      throw cause;
     }
   }
 
@@ -121,8 +130,13 @@
       await reload();
       watchEvents();
     } catch (cause) {
-      error = errorMessage(cause);
+      throw cause;
     }
+  }
+
+  async function cancelRetailer(retailerId: string) {
+    await cancelRetailerSession(retailerId);
+    await reload();
   }
 </script>
 
@@ -132,7 +146,7 @@
 <main>
   <SearchForm bind:query bind:ukSize bind:brand bind:colourway bind:department bind:pinCode {searching} on:search={startSearch} />
   <div class="alert" role="alert" hidden={!error}>{error}</div>
-  <ResultsSection sectionOffers={offers} sectionRetailers={retailers} sectionSearching={searching} {cached} resultRequest={displayedRequest} {inputsChanged} visible={Boolean(searching || searchId)} canRefresh={Boolean(searchId && !searching)} refresh={refreshDisplayed} {searchId} connect={connectRetailer} complete={completeRetailer} />
+  <ResultsSection sectionOffers={offers} sectionRetailers={retailers} sectionSearching={searching} {cached} resultRequest={displayedRequest} {resolvedQuery} {searchOriginal} {inputsChanged} visible={Boolean(searching || searchId)} canRefresh={Boolean(searchId && !searching)} refresh={refreshDisplayed} {searchId} connect={connectRetailer} complete={completeRetailer} cancel={cancelRetailer} />
   <aside class="disclaimer"><b>Before you buy</b><p>Prices, stock, shipping, seller status, returns, and coupon eligibility can change. Always reconfirm every detail on the retailer’s product and checkout pages.</p></aside>
 </main>
 <footer>Built for local, personal price comparison · INR only · No affiliate tracking</footer>

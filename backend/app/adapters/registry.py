@@ -1,4 +1,5 @@
 from .base import RetailerDefinition
+from .asics import AsicsAdapter
 from .brandman import BrandmanAdapter
 from .browser import BrowserMarketplaceAdapter
 from .converse import ConverseAdapter
@@ -13,7 +14,7 @@ DEFINITIONS = [
     RetailerDefinition("nike", "Nike India", "official", "https://www.nike.com/in/w?q={query}&vst={query}", adapter_type="official_catalog", footwear_only_scope=True),
     RetailerDefinition("adidas", "Adidas India", "official", "https://www.adidas.co.in/search?q={query}", adapter_type="official_catalog", footwear_only_scope=True),
     PumaAdapter.definition,  # adapter_type="puma"
-    RetailerDefinition("asics", "ASICS India", "official", "https://www.asics.co.in/catalogsearch/result/?q={query}", adapter_type="official_catalog", footwear_only_scope=True),
+    AsicsAdapter.definition,
     BrandmanAdapter.definition,  # adapter_type="brandman"
     RetailerDefinition("converse", "Converse India", "official", "https://www.converse.in/search?q={query}", adapter_type="converse"),
     RetailerDefinition("reebok", "Reebok India", "official", "https://reebok.abfrl.in/c/search?search_query={query}", uses_browser=True, adapter_type="browser", session_capable=True),
@@ -32,6 +33,8 @@ def _build_adapter(definition: RetailerDefinition):
     t = definition.adapter_type
     if t == "puma":
         return PumaAdapter()
+    if t == "asics":
+        return AsicsAdapter()
     if t == "onitsuka":
         return OnitsukaAdapter()
     if t == "converse":

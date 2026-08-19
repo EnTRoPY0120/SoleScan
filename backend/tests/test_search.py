@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from app.adapters.base import RetailerAdapter, RetailerBlockedError, RetailerDefinition
 from app.db import init_db
+from app.query_resolution import ModelVocabulary, TrustedModel
 from app.schemas import Offer, SearchRequest
 from app.search import SearchManager
 
@@ -50,6 +51,93 @@ async def test_cache_and_refresh_bypass():
     assert second.cached and second.state == "complete"
     refreshed = await manager.create(request.model_copy(), bypass_cache=True)
     assert not refreshed.cached
+
+
+async def test_search_preserves_original_query_but_collects_with_resolved_query():
+    init_db()
+
+    class CapturingAdapter(FakeAdapter):
+        seen_query = None
+
+        async def search(self, request, *, bypass_cache=False):
+            self.seen_query = request.query
+            return []
+
+    adapter = CapturingAdapter("resolved")
+    manager = SearchManager(
+        [adapter],
+        vocabulary=ModelVocabulary([TrustedModel("Onitsuka Tiger", "MEXICO 66")]),
+    )
+    created = await manager.create(
+        SearchRequest(query="onitsuka mexio 66", uk_size="9"),
+        bypass_cache=True,
+    )
+    result = await wait_complete(manager, str(created.id))
+
+    assert result.request.query == "onitsuka mexio 66"
+    assert result.resolved_query == "onitsuka mexico 66"
+    assert adapter.seen_query == "onitsuka mexico 66"
+    reloaded = SearchManager(
+        [adapter],
+        vocabulary=ModelVocabulary([TrustedModel("Onitsuka Tiger", "MEXICO 66")]),
+    ).get(str(result.id))
+    assert reloaded.resolved_query == "onitsuka mexico 66"
+
+
+async def test_verified_official_offer_teaches_the_next_search():
+    init_db()
+
+    class OnitsukaAdapter(FakeAdapter):
+        async def search(self, request, *, bypass_cache=False):
+            return [Offer(
+                retailer="Onitsuka Tiger India", seller="Onitsuka Tiger India",
+                product_name="MEXICO 66", brand="Onitsuka Tiger", model="MEXICO 66",
+                category="footwear",
+                requested_uk_size=request.uk_size, size_available=True,
+                listed_price_paise=1100000, shipping_paise=0,
+                effective_price_paise=1100000,
+                product_url="https://example.com/mexico-66", match_score=0,
+                last_checked=datetime.now(timezone.utc),
+            )]
+
+    manager = SearchManager([OnitsukaAdapter("onitsuka_learning")])
+    exact = await manager.create(
+        SearchRequest(query="onitsuka mexico 66", uk_size="9"), bypass_cache=True
+    )
+    await wait_complete(manager, str(exact.id))
+
+    typo = await manager.create(
+        SearchRequest(query="onitsuka mexio 66", uk_size="9")
+    )
+    result = await wait_complete(manager, str(typo.id))
+
+    assert result.resolved_query == "onitsuka mexico 66"
+    assert result.cached is True
+    assert len(result.offers) == 1
+
+
+async def test_shopper_can_search_the_original_text_without_correction():
+    init_db()
+
+    class CapturingAdapter(FakeAdapter):
+        seen_query = None
+
+        async def search(self, request, *, bypass_cache=False):
+            self.seen_query = request.query
+            return []
+
+    adapter = CapturingAdapter("literal")
+    manager = SearchManager(
+        [adapter],
+        vocabulary=ModelVocabulary([TrustedModel("Onitsuka Tiger", "MEXICO 66")]),
+    )
+    created = await manager.create(SearchRequest(
+        query="onitsuka mexio 66", uk_size="9", allow_query_correction=False,
+    ), bypass_cache=True)
+    result = await wait_complete(manager, str(created.id))
+
+    assert result.resolved_query is None
+    assert adapter.seen_query == "onitsuka mexio 66"
 
 async def test_retailer_timeout_is_partial_failure():
     manager = SearchManager([FakeAdapter("fast"), FakeAdapter("slow", delay=.3)])

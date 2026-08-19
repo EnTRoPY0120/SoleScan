@@ -30,6 +30,7 @@ class ProductCategory(str, Enum):
 class SearchRequest(BaseModel):
     query: str = Field(min_length=2, max_length=120)
     uk_size: str = Field(min_length=1, max_length=12)
+    allow_query_correction: bool = True
     brand: str | None = Field(default=None, max_length=60)
     colourway: str | None = Field(default=None, max_length=100)
     department: Department = Department.any
@@ -117,11 +118,16 @@ class RetailerStatus(BaseModel):
     retry_at: datetime | None = None
     session_capable: bool = False
     session_state: Literal["none", "starting", "active", "expired"] = "none"
+    outcome: Literal[
+        "offers_found", "valid_empty", "verification_required", "access_blocked",
+        "contract_changed", "transport_failure", "internal_failure",
+    ] | None = None
 
 
 class SearchResult(BaseModel):
     id: UUID
     request: SearchRequest
+    resolved_query: str | None = None
     state: Literal["running", "complete"]
     offers: list[Offer]
     retailers: list[RetailerStatus]
